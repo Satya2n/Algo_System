@@ -1,7 +1,6 @@
 # engine/execution.py
 import logging
 import time as pytime
-import pandas as pd
 from typing import Optional, Tuple
 from .state import ActiveTrade, StateManager
 import config.settings as cfg
@@ -98,16 +97,7 @@ class ExecutionEngine:
         self._send_alert("ENTRY FILLED", trade)
         return trade
 
-    def get_trailing_stop(self, live_df: pd.DataFrame, side: str) -> Optional[float]:
-        if live_df is None or len(live_df) < 3:
-            return None
-        last3 = live_df.tail(3)
-        if side == "BUY":
-            return float(last3["low"].min())
-        else:
-            return float(last3["high"].max())
-
-    def manage_open_trade(self, trade: ActiveTrade, ltp: float, live_df: pd.DataFrame) -> Tuple[ActiveTrade, bool]:
+    def manage_open_trade(self, trade: ActiveTrade, ltp: float) -> Tuple[ActiveTrade, bool]:
         """
         Returns (updated_trade, is_closed).
 

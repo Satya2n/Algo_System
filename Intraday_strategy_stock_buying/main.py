@@ -106,14 +106,10 @@ def main():
                     ltp = all_ltp.get(trade.symbol)
                     if not ltp: continue
 
-                    # Fetch live DF for trailing stop extreme calculation
-                    df = tsl.get_historical_data(tradingsymbol=trade.symbol, exchange="NSE", timeframe="5")
-                    if df is not None and not df.empty:
-                        live_df = prepare_live_df(df)
-                        updated_trade, closed = executor.manage_open_trade(trade, ltp, live_df)
-                        if closed:
-                            state_manager.remove_trade(trade.symbol)
-                            
+                    updated_trade, closed = executor.manage_open_trade(trade, ltp)
+                    if closed:
+                        state_manager.remove_trade(trade.symbol)
+
                 time.sleep(cfg.FAST_POLL_INTERVAL_SECONDS)
 
             # ==========================================
