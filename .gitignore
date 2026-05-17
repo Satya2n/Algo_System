@@ -1,0 +1,50 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs
+*.log
+logs/
+**/log_files/
+
+# Sensitive / token files
+access_token.rtfd/
+**/token_*.txt
+
+# Zip archives
+*.zip
+
+# Temp Office files
+~$*
+
+# Runtime state & outputs
+**/state/engine_state.json
+**/state/engine_state.json.tmp
+**/state/trade_book.csv
+**/backtester/cache/
+
+# Instrument data snapshots (auto-downloaded)
+"**/Dependencies\\all_instrument *.csv"
+**/Dependencies/all_instrument*.csv
+Dependencies/
