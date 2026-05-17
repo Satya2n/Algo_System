@@ -63,10 +63,10 @@ logger = logging.getLogger("BACKTEST")
 MIN_TRADES        = 8      # ignore stocks with fewer signals (too thin)
 MIN_PROFIT_FACTOR = 1.2    # at least 20% more wins than losses by value
 MIN_AVG_R         = 0.05   # average R-multiple must be positive & meaningful
-MAX_STOCKS        = 15     # cap watchlist so live engine doesn't spread too thin
+MAX_STOCKS        = 12     # top 12 only — matches MAX_CONCURRENT_TRADES = 5
 
 # ── simulation settings ───────────────────────────────────────────────────────
-TP1_RR           = 1.5    # reward:risk ratio for first partial exit
+TP1_RR           = 1.75   # matches live engine TP1_REWARD_RATIO
 ENTRY_START_H    = (9, 30)
 ENTRY_END_H      = (12, 0) # no new entries after noon
 FORCE_EXIT_H     = (15, 15)
