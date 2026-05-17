@@ -44,6 +44,9 @@ access_token.rtfd/
 **/state/trade_book.csv
 **/backtester/cache/
 
+# Deployment docs (contain server IP / sensitive infra details)
+**/docs/AWS_EC2_DEPLOYMENT_GUIDE.md
+
 # Instrument data snapshots (auto-downloaded)
 "**/Dependencies\\all_instrument *.csv"
 **/Dependencies/all_instrument*.csv
