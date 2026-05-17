@@ -88,11 +88,8 @@ def main():
 
             # Lock Daily Capital (Prevents shrinking sizing bug)
             if risk_manager.daily_starting_capital == 0.0:
-                if not cfg.PAPER_TRADE:
-                    bal = float(tsl.get_balance())
-                    risk_manager.set_daily_capital(bal)
-                else:
-                    risk_manager.set_daily_capital(100000.0)
+                risk_manager.set_daily_capital(cfg.CAPITAL)
+                logger.info(f"Capital locked at ₹{cfg.CAPITAL:,.0f}")
 
             current_ts = time.time()
             

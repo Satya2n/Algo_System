@@ -4,14 +4,21 @@ from datetime import time
 # =========================================================
 # SYSTEM TOGGLES
 # =========================================================
-PAPER_TRADE = True
+PAPER_TRADE = False
 
 # =========================================================
 # CAPITAL & RISK
 # =========================================================
-CAPITAL_UTILIZATION = 0.95      # Keep 5% buffer unused
-MAX_DAILY_LOSS_PCT = 3.0        # Max daily portfolio loss limit (%)
-MAX_RISK_PER_TRADE_PCT = 1.0    # Max risk per trade (%)
+CAPITAL_UTILIZATION    = 0.95   # Keep 5% buffer unused
+
+# ₹50,000 real capital × 4.5x intraday margin = ₹2,25,000 effective
+CAPITAL                = 225000.0
+
+# 1% of real capital (₹500) / effective (₹2,25,000) = 0.22%
+MAX_RISK_PER_TRADE_PCT = 0.22
+
+# 5 trades × ₹500 = ₹2,500 worst case = 1.1% of effective
+MAX_DAILY_LOSS_PCT     = 1.5
 
 # =========================================================
 # CAPACITY LIMITS
