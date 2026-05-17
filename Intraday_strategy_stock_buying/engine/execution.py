@@ -109,63 +109,37 @@ class ExecutionEngine:
 
     def manage_open_trade(self, trade: ActiveTrade, ltp: float, live_df: pd.DataFrame) -> Tuple[ActiveTrade, bool]:
         """
-        Returns (updated_trade, is_closed)
+        Returns (updated_trade, is_closed).
+
+        Exit logic — full exit, no partial booking, no trailing:
+          SL hit  → exit 100% at SL price  → closed
+          TP1 hit → exit 100% at TP1 price → closed
         """
         closed = False
 
-        if getattr(trade, "pending_sl_update", False) and not cfg.PAPER_TRADE:
-            exit_txn = "SELL" if trade.side == "BUY" else "BUY"
-            new_sl_id = self.tsl.order_placement(
-                tradingsymbol=trade.symbol, exchange="NSE", quantity=trade.remaining_qty, price=0, trigger_price=trade.pending_sl_price,
-                order_type="STOPMARKET", transaction_type=exit_txn, trade_type="MIS"
-            )
-            if new_sl_id:
-                trade.sl_order_id = new_sl_id
-                trade.trail_sl = trade.pending_sl_price
-                trade.pending_sl_update = False
-                trade.pending_sl_price = 0.0
-                self.logger.info(f"[{trade.symbol}] LIVE SL successfully placed at {trade.trail_sl}")
-                self.state_manager.update_trade(trade)
-                self._send_alert("TRAIL SL PLACED", trade)
-            else:
-                self.logger.warning(f"[{trade.symbol}] LIVE SL replacement failed. Will retry.")
-            
-            return trade, closed
-
         if cfg.PAPER_TRADE:
-            # Paper trade SL check
-            sl_hit = (trade.side == "BUY" and ltp <= trade.trail_sl) or (trade.side == "SELL" and ltp >= trade.trail_sl)
+            # SL check
+            sl_hit = (trade.side == "BUY" and ltp <= trade.stop_loss) or \
+                     (trade.side == "SELL" and ltp >= trade.stop_loss)
             if sl_hit:
-                trade.pnl += (trade.trail_sl - trade.entry_price) * trade.remaining_qty if trade.side == "BUY" else (trade.entry_price - trade.trail_sl) * trade.remaining_qty
-                self.logger.info(f"[{trade.symbol}] PAPER SL HIT at {trade.trail_sl}. Trade closed.")
+                trade.pnl += (trade.stop_loss - trade.entry_price) * trade.qty if trade.side == "BUY" \
+                         else (trade.entry_price - trade.stop_loss) * trade.qty
+                self.logger.info(f"[{trade.symbol}] PAPER SL HIT at {trade.stop_loss}. Trade closed.")
                 self._send_alert("PAPER SL HIT", trade)
                 closed = True
                 return trade, closed
 
-            # Paper trade TP1 check
-            tp1_hit = (trade.side == "BUY" and ltp >= trade.tp1) or (trade.side == "SELL" and ltp <= trade.tp1)
-            if not trade.partial_done and tp1_hit:
-                partial_qty = max(1, trade.qty // 2)
-                partial_pnl = (ltp - trade.entry_price) * partial_qty if trade.side == "BUY" else (trade.entry_price - ltp) * partial_qty
-                
-                trade.partial_done = True
-                trade.remaining_qty = trade.qty - partial_qty
-                trade.pnl += partial_pnl
-                trade.trail_sl = trade.entry_price # Move to breakeven
-                self.logger.info(f"[{trade.symbol}] PAPER TP1 HIT. Booked 50%. SL moved to BE.")
-                self.state_manager.update_trade(trade)
-                self._send_alert("PAPER TP1 HIT", trade)
+            # TP1 check — full exit
+            tp1_hit = (trade.side == "BUY" and ltp >= trade.tp1) or \
+                      (trade.side == "SELL" and ltp <= trade.tp1)
+            if tp1_hit:
+                trade.pnl += (trade.tp1 - trade.entry_price) * trade.qty if trade.side == "BUY" \
+                         else (trade.entry_price - trade.tp1) * trade.qty
+                self.logger.info(f"[{trade.symbol}] PAPER TP1 HIT at {trade.tp1}. Full exit.")
+                self._send_alert("PAPER TP1 FULL EXIT", trade)
+                closed = True
+                return trade, closed
 
-            # Paper trailing
-            if trade.partial_done:
-                trail_sl = self.get_trailing_stop(live_df, trade.side)
-                if trail_sl:
-                    if (trade.side == "BUY" and trail_sl > trade.trail_sl) or (trade.side == "SELL" and trail_sl < trade.trail_sl):
-                        trade.trail_sl = round(trail_sl, 1)
-                        self.logger.info(f"[{trade.symbol}] PAPER Trailing SL updated to {trade.trail_sl}")
-                        self.state_manager.update_trade(trade)
-                        self._send_alert("PAPER TRAIL UPDATED", trade)
-            
             return trade, closed
 
         # ================= LIVE MANAGEMENT =================
@@ -173,63 +147,45 @@ class ExecutionEngine:
         status = self.tsl.get_order_status(orderid=trade.sl_order_id)
         if status == "TRADED":
             exit_price = self.tsl.get_executed_price(orderid=trade.sl_order_id)
-            if exit_price is None: exit_price = trade.trail_sl # NoneType Math crash fix
-            
-            trail_pnl = (exit_price - trade.entry_price) * trade.remaining_qty if trade.side == "BUY" else (trade.entry_price - exit_price) * trade.remaining_qty
-            trade.pnl += trail_pnl
-            self.logger.info(f"[{trade.symbol}] LIVE SL HIT. Trade closed.")
+            if exit_price is None:
+                exit_price = trade.stop_loss
+            trade.pnl += (exit_price - trade.entry_price) * trade.qty if trade.side == "BUY" \
+                     else (trade.entry_price - exit_price) * trade.qty
+            self.logger.info(f"[{trade.symbol}] LIVE SL HIT at {exit_price}. Trade closed.")
             self._send_alert("LIVE SL HIT", trade)
             closed = True
             return trade, closed
 
-        # 2. Check TP1
-        tp1_hit = (trade.side == "BUY" and ltp >= trade.tp1) or (trade.side == "SELL" and ltp <= trade.tp1)
-        if not trade.partial_done and tp1_hit:
-            partial_qty = max(1, trade.qty // 2)
+        # 2. TP1 hit — cancel SL, full exit
+        tp1_hit = (trade.side == "BUY" and ltp >= trade.tp1) or \
+                  (trade.side == "SELL" and ltp <= trade.tp1)
+        if tp1_hit:
             exit_txn = "SELL" if trade.side == "BUY" else "BUY"
-            
-            limit_price = round(ltp * 0.99 * 20) / 20 if exit_txn == "SELL" else round(ltp * 1.01 * 20) / 20
-            
-            # Fire limit order for 50%
+            limit_price = round(ltp * 0.99 * 20) / 20 if exit_txn == "SELL" \
+                     else round(ltp * 1.01 * 20) / 20
+
+            # Cancel the SL order first
+            try:
+                self.tsl.cancel_order(OrderID=trade.sl_order_id)
+            except Exception:
+                pass
+
+            # Full exit
             exit_orderid = self.tsl.order_placement(
-                tradingsymbol=trade.symbol, exchange="NSE", quantity=partial_qty, price=limit_price, trigger_price=0,
+                tradingsymbol=trade.symbol, exchange="NSE", quantity=trade.qty,
+                price=limit_price, trigger_price=0,
                 order_type="LIMIT", transaction_type=exit_txn, trade_type="MIS"
             )
-            partial_exit_price = self.tsl.get_executed_price(orderid=exit_orderid)
-            if partial_exit_price is None: partial_exit_price = ltp # NoneType Math Crash fix
-            
-            partial_pnl = (partial_exit_price - trade.entry_price) * partial_qty if trade.side == "BUY" else (trade.entry_price - partial_exit_price) * partial_qty
-            
-            trade.partial_done = True
-            trade.remaining_qty -= partial_qty
-            trade.pnl += partial_pnl
-            
-            # Ghost Order Fix: Cancel old SL, flag trade for async SL placement
-            self.tsl.cancel_order(OrderID=trade.sl_order_id)
-            
-            breakeven_sl = round(trade.entry_price, 1)
-            trade.pending_sl_update = True
-            trade.pending_sl_price = breakeven_sl
-            trade.trail_sl = breakeven_sl
-            
-            self.logger.info(f"[{trade.symbol}] LIVE TP1 HIT. Booked 50%. SL cancel sent. SL update pending.")
-            self.state_manager.update_trade(trade)
-            self._send_alert("TP1 BOOKED", trade)
+            exit_price = self.tsl.get_executed_price(orderid=exit_orderid)
+            if exit_price is None:
+                exit_price = ltp
 
-        # 3. Trailing SL
-        if trade.partial_done and not getattr(trade, "pending_sl_update", False):
-            trail_sl = self.get_trailing_stop(live_df, trade.side)
-            if trail_sl:
-                if (trade.side == "BUY" and trail_sl > trade.trail_sl) or (trade.side == "SELL" and trail_sl < trade.trail_sl):
-                    # Ghost Order Fix
-                    self.tsl.cancel_order(OrderID=trade.sl_order_id)
-                    
-                    trade.pending_sl_update = True
-                    trade.pending_sl_price = round(trail_sl, 1)
-                    trade.trail_sl = round(trail_sl, 1)
-
-                    self.logger.info(f"[{trade.symbol}] LIVE Trailing SL cancel sent. SL update pending -> {trade.trail_sl}")
-                    self.state_manager.update_trade(trade)
+            trade.pnl += (exit_price - trade.entry_price) * trade.qty if trade.side == "BUY" \
+                     else (trade.entry_price - exit_price) * trade.qty
+            self.logger.info(f"[{trade.symbol}] LIVE TP1 HIT at {exit_price}. Full exit.")
+            self._send_alert("LIVE TP1 FULL EXIT", trade)
+            closed = True
+            return trade, closed
 
         return trade, closed
 
