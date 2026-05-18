@@ -68,8 +68,15 @@ class ExecutionEngine:
             actual_entry_price = entry_price
 
         # 2. Place Stop Loss (ORPHAN PROTECTION LOGIC)
+        # Dhan requires price > trigger for BUY stop (short SL)
+        # and price < trigger for SELL stop (long SL)
+        if exit_txn == "BUY":
+            sl_limit = round(sl_price * 1.01 * 20) / 20   # above trigger
+        else:
+            sl_limit = round(sl_price * 0.99 * 20) / 20   # below trigger
+
         sl_orderid = self.tsl.order_placement(
-            tradingsymbol=symbol, exchange="NSE", quantity=qty, price=0, trigger_price=sl_price,
+            tradingsymbol=symbol, exchange="NSE", quantity=qty, price=sl_limit, trigger_price=sl_price,
             order_type="STOPMARKET", transaction_type=exit_txn, trade_type="MIS"
         )
 
