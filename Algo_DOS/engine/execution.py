@@ -600,14 +600,36 @@ class ExecutionEngine:
             "remarks": trade.remarks,
         })
 
+        spread_type = "Bull Put Spread" if plan["option_side"] == "PE" else "Bear Call Spread"
+        short_strike = plan["short"]["strike"]
+        hedge_strike = plan["hedge"]["strike"]
+        short_ltp    = plan["short"]["ltp"]
+        hedge_ltp    = plan["hedge"]["ltp"]
+        spread_width = abs(short_strike - hedge_strike)
+        max_loss     = (spread_width - entry_credit) * qty_total
+        target_pnl   = entry_credit * self.cfg.target_profit_pct * qty_total
+        stop_pnl     = entry_credit * self.cfg.stop_loss_pct * qty_total
+
         self._safe_send(
-            f"🟢 PAPER ENTRY\n"
-            f"Signal: {trade.side}\n"
-            f"Symbol: {trade.symbol}\n"
-            f"Short: {trade.short_leg_symbol}\n"
-            f"Hedge: {trade.hedge_leg_symbol}\n"
-            f"Qty: {trade.qty}\n"
-            f"Credit: {trade.entry_price:.2f}"
+            f"🟢 PAPER ENTRY — {trade.symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Strategy  : {spread_type}\n"
+            f"Signal    : {trade.side}\n"
+            f"──── NIFTY ────\n"
+            f"Spot Price: ₹{entry_spot:.2f}\n"
+            f"──── SPREAD ────\n"
+            f"Short Leg : {trade.short_leg_symbol}\n"
+            f"  Strike  : ₹{short_strike:.0f}  |  LTP: ₹{short_ltp:.2f}\n"
+            f"Hedge Leg : {trade.hedge_leg_symbol}\n"
+            f"  Strike  : ₹{hedge_strike:.0f}  |  LTP: ₹{hedge_ltp:.2f}\n"
+            f"──── TRADE ────\n"
+            f"Net Credit: ₹{entry_credit:.2f}\n"
+            f"Qty       : {qty_total} shares\n"
+            f"──── TARGETS ────\n"
+            f"Target    : Credit decays 65% → P&L +₹{target_pnl:.0f}\n"
+            f"Stop Loss : Credit inflates 85% → P&L -₹{stop_pnl:.0f}\n"
+            f"Max Loss  : ₹{max_loss:.0f} (spread width)\n"
+            f"R:R       : 1:{round(target_pnl/stop_pnl,2) if stop_pnl else 'N/A'}"
         )
 
         self.logger.info(
@@ -649,11 +671,17 @@ class ExecutionEngine:
             "remarks": trade.remarks,
         })
 
+        emoji = "✅" if trade.pnl > 0 else "❌"
         self._safe_send(
-            f"🔴 PAPER EXIT\n"
-            f"Symbol: {trade.symbol}\n"
-            f"Reason: {reason}\n"
-            f"PnL: {trade.pnl:.2f}"
+            f"{emoji} PAPER EXIT — {trade.symbol}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"Reason     : {reason}\n"
+            f"Short Leg  : {trade.short_leg_symbol}\n"
+            f"Hedge Leg  : {trade.hedge_leg_symbol}\n"
+            f"Entry Cred : ₹{float(trade.entry_price):.2f}\n"
+            f"Exit Cred  : ₹{float(trade.exit_price):.2f}\n"
+            f"Qty        : {trade.qty}\n"
+            f"PnL        : ₹{trade.pnl:.2f}"
         )
 
         self.logger.info(f"[PAPER EXIT] {reason} | pnl={trade.pnl:.2f}")
