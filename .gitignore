@@ -47,6 +47,9 @@ access_token.rtfd/
 # Deployment docs (contain server IP / sensitive infra details)
 **/docs/AWS_EC2_DEPLOYMENT_GUIDE.md
 
+# Credentials — never commit real tokens
+**/config/credentials.py
+
 # Instrument data snapshots (auto-downloaded)
 "**/Dependencies\\all_instrument *.csv"
 **/Dependencies/all_instrument*.csv
