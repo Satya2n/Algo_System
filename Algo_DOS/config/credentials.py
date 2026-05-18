@@ -24,7 +24,7 @@ DHAN_ACCESS_TOKEN = ""
 # TELEGRAM
 # =========================================================
 
-TELEGRAM_BOT_TOKEN = "8262782839:AAFczqNA0bot2ewnQoAWa9m92ayqafhUL5c"
+TELEGRAM_BOT_TOKEN = "8987149818:AAF4MUVNskfDKRtHU2hws0n912ig4XRBW9I"
 
 TELEGRAM_CHAT_ID = "626705484"
 
