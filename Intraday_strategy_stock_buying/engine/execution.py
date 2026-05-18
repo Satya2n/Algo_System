@@ -18,16 +18,51 @@ class ExecutionEngine:
     def _send_alert(self, title: str, trade: ActiveTrade):
         from config.credentials import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
         try:
-            msg = (
-                f"[{title}]\n"
-                f"Symbol: {trade.symbol}\n"
-                f"Side: {trade.side}\n"
-                f"Qty: {trade.qty}\n"
-                f"Entry: {trade.entry_price}\n"
-                f"SL: {trade.stop_loss}\n"
-                f"TP1: {trade.tp1}\n"
-                f"PnL: {trade.pnl}"
-            )
+            is_entry = "ENTRY" in title
+            is_sl    = "SL" in title
+            is_tp    = "TP1" in title
+            is_sq    = "SQUARE" in title
+
+            if is_entry:
+                direction = "LONG (BUY)" if trade.side == "BUY" else "SHORT (SELL)"
+                msg = (
+                    f"🚀 ENTRY — {trade.symbol}\n"
+                    f"──────────────────\n"
+                    f"Direction : {direction}\n"
+                    f"Qty       : {trade.qty}\n"
+                    f"Entry     : ₹{trade.entry_price:.2f}\n"
+                    f"Stop Loss : ₹{trade.stop_loss:.2f}\n"
+                    f"Target    : ₹{trade.tp1:.2f}\n"
+                    f"Risk/Reward: 1:1.75"
+                )
+            elif is_tp:
+                msg = (
+                    f"✅ TARGET HIT — {trade.symbol}\n"
+                    f"──────────────────\n"
+                    f"Qty   : {trade.qty}\n"
+                    f"Entry : ₹{trade.entry_price:.2f}\n"
+                    f"Target: ₹{trade.tp1:.2f}\n"
+                    f"PnL   : ₹{trade.pnl:.2f}"
+                )
+            elif is_sl:
+                msg = (
+                    f"❌ STOP LOSS HIT — {trade.symbol}\n"
+                    f"──────────────────\n"
+                    f"Qty   : {trade.qty}\n"
+                    f"Entry : ₹{trade.entry_price:.2f}\n"
+                    f"SL    : ₹{trade.stop_loss:.2f}\n"
+                    f"PnL   : ₹{trade.pnl:.2f}"
+                )
+            elif is_sq:
+                msg = (
+                    f"⏹ FORCE EXIT — {trade.symbol}\n"
+                    f"──────────────────\n"
+                    f"Qty : {trade.qty}\n"
+                    f"PnL : ₹{trade.pnl:.2f}"
+                )
+            else:
+                msg = f"[{title}] {trade.symbol}"
+
             self.tsl.send_telegram_alert(
                 message=msg,
                 receiver_chat_id=TELEGRAM_CHAT_ID,
