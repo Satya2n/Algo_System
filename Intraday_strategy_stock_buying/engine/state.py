@@ -28,6 +28,11 @@ class EngineState:
     trade_count_today: int
     active_trades: Dict[str, ActiveTrade]
     realized_daily_pnl: float = 0.0
+    traded_symbols_today: list = None
+
+    def __post_init__(self):
+        if self.traded_symbols_today is None:
+            self.traded_symbols_today = []
 
 class StateManager:
     def __init__(self, state_file: str = "state/engine_state.json"):
@@ -53,7 +58,8 @@ class StateManager:
                     date=data.get("date", today),
                     trade_count_today=data.get("trade_count_today", 0),
                     active_trades=active_trades,
-                    realized_daily_pnl=data.get("realized_daily_pnl", 0.0)
+                    realized_daily_pnl=data.get("realized_daily_pnl", 0.0),
+                    traded_symbols_today=data.get("traded_symbols_today", [])
                 )
             except Exception as e:
                 import logging
@@ -66,6 +72,7 @@ class StateManager:
             "date": self.state.date,
             "trade_count_today": self.state.trade_count_today,
             "realized_daily_pnl": self.state.realized_daily_pnl,
+            "traded_symbols_today": self.state.traded_symbols_today,
             "active_trades": {k: asdict(v) for k, v in self.state.active_trades.items()}
         }
         tmp_path = self.state_file + ".tmp"
@@ -76,7 +83,12 @@ class StateManager:
     def add_trade(self, trade: ActiveTrade):
         self.state.active_trades[trade.symbol] = trade
         self.state.trade_count_today += 1
+        if trade.symbol not in self.state.traded_symbols_today:
+            self.state.traded_symbols_today.append(trade.symbol)
         self.save_state()
+
+    def has_traded_today(self, symbol: str) -> bool:
+        return symbol in self.state.traded_symbols_today
 
     def remove_trade(self, symbol: str):
         if symbol in self.state.active_trades:

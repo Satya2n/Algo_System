@@ -136,7 +136,9 @@ def main():
 
                 for sym in watchlist:
                     if state_manager.get_trade(sym):
-                        continue # Already in trade
+                        continue  # already in active trade
+                    if state_manager.has_traded_today(sym):
+                        continue  # already traded this symbol today — no re-entry
 
                     stock_full = tsl.get_historical_data(tradingsymbol=sym, exchange="NSE", timeframe="5")
                     if stock_full is None or len(stock_full) == 0:
