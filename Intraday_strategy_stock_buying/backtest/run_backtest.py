@@ -34,6 +34,7 @@ sys.path.insert(0, str(ROOT))
 
 from config.credentials import (
     DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, DHAN_PIN, DHAN_TOTP_SECRET,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
 )
 from engine.strategy import (
     standardize_df, add_full_indicators, get_today_session,
@@ -42,6 +43,21 @@ from engine.strategy import (
 )
 from backtest.universe import NIFTY_200
 from Dhan_Tradehull import Tradehull
+
+
+# ── Telegram helper ───────────────────────────────────────────────────────────
+
+def send_telegram(message: str) -> None:
+    try:
+        import requests
+        from urllib.parse import quote
+        url = (
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+            f"/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={quote(message)}"
+        )
+        requests.get(url, timeout=15)
+    except Exception as e:
+        logger.warning(f"Telegram send failed: {e}")
 
 # ── output dirs ───────────────────────────────────────────────────────────────
 RESULTS_DIR  = ROOT / "backtest" / "results"
@@ -462,6 +478,7 @@ def run():
     print("=" * 60)
 
     # ── signal breakdown ──────────────────────────────────────────────────────
+    long_r = short_r = 0.0
     if all_trades:
         all_df  = pd.DataFrame(all_trades)
         long_r  = all_df[all_df["signal"] == "LONG"]["r_mult"].mean()
@@ -469,6 +486,42 @@ def run():
         print(f"\nSignal edge across all qualified stocks:")
         print(f"  LONG  trades avg R = {long_r:+.3f}")
         print(f"  SHORT trades avg R = {short_r:+.3f}")
+
+    # ── Telegram report ───────────────────────────────────────────────────────
+    from datetime import timedelta
+    next_sunday = (datetime.now() + timedelta(days=(6 - datetime.now().weekday()) % 7 + 1)).strftime("%d %b %Y")
+
+    if not preferred.empty:
+        lines = [
+            f"📊 WEEKLY WATCHLIST — {datetime.now().strftime('%d %b %Y')}",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            f"Universe : {total} stocks tested",
+            f"Selected : {len(preferred)} stocks",
+            f"Duration : {elapsed:.0f} minutes",
+            f"",
+            f"{'#':<3} {'Stock':<12} {'WR%':>5} {'AvgR':>6} {'PF':>5}",
+            f"{'─'*35}",
+        ]
+        for i, (_, row) in enumerate(preferred.iterrows(), 1):
+            lines.append(
+                f"{i:<3} {row['symbol']:<12} {row['win_rate']:>4.1f}% {row['avg_r']:>+6.3f} {row['profit_factor']:>5.2f}"
+            )
+        lines += [
+            f"",
+            f"Signal edge (qualified stocks):",
+            f"  LONG  avg R = {long_r:+.3f}",
+            f"  SHORT avg R = {short_r:+.3f}",
+            f"",
+            f"⏰ Next backtest: {next_sunday}",
+        ]
+        send_telegram("\n".join(lines))
+        logger.info("Telegram watchlist report sent.")
+    else:
+        send_telegram(
+            f"⚠️ WEEKLY BACKTEST — {datetime.now().strftime('%d %b %Y')}\n"
+            f"No stocks passed the filter this week.\n"
+            f"Watchlist NOT updated. Check thresholds."
+        )
 
 
 if __name__ == "__main__":
