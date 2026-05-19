@@ -47,6 +47,9 @@ access_token.rtfd/
 # Deployment docs (contain server IP / sensitive infra details)
 **/docs/AWS_EC2_DEPLOYMENT_GUIDE.md
 
+# Trade data Excel (local only — contains live trading data)
+analysis/trades_data.xlsx
+
 # Credentials — never commit real tokens
 **/config/credentials.py
 
