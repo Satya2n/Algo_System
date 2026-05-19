@@ -15,7 +15,7 @@ class ExecutionEngine:
     def _mock_order_id(self, prefix: str) -> str:
         return f"{prefix}_{int(pytime.time() * 1000)}"
 
-    def _send_alert(self, title: str, trade: ActiveTrade):
+    def _send_alert(self, title: str, trade: ActiveTrade, slippage_pts: float = 0.0, slippage_pct: float = 0.0):
         from config.credentials import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
         try:
             is_entry = "ENTRY" in title
@@ -25,6 +25,7 @@ class ExecutionEngine:
 
             if is_entry:
                 direction = "LONG (BUY)" if trade.side == "BUY" else "SHORT (SELL)"
+                slip_flag = f"⚠️ High" if abs(slippage_pct) > 0.3 else "✅ Normal"
                 msg = (
                     f"🚀 ENTRY — {trade.symbol}\n"
                     f"──────────────────\n"
@@ -33,7 +34,8 @@ class ExecutionEngine:
                     f"Entry     : ₹{trade.entry_price:.2f}\n"
                     f"Stop Loss : ₹{trade.stop_loss:.2f}\n"
                     f"Target    : ₹{trade.tp1:.2f}\n"
-                    f"Risk/Reward: 1:1.75"
+                    f"Risk/Reward: 1:1.75\n"
+                    f"Slippage  : {slippage_pts:+.2f} pts ({slippage_pct:+.3f}%) {slip_flag}"
                 )
             elif is_tp:
                 msg = (
@@ -105,6 +107,28 @@ class ExecutionEngine:
         return ltp  # fallback to LTP if fetch fails
 
     # =========================================================
+    # TICK SIZE HELPER
+    # =========================================================
+
+    def _get_tick_size(self, symbol: str) -> float:
+        """Fetch tick size from Dhan instrument file. Defaults to ₹0.05."""
+        try:
+            inst = getattr(self.tsl, "instrument_df", None)
+            if inst is not None and not inst.empty:
+                row = inst[inst["SEM_TRADING_SYMBOL"] == symbol]
+                if not row.empty:
+                    tick = float(row.iloc[0].get("SEM_TICK_SIZE", 0.05))
+                    if tick > 0:
+                        return tick
+        except Exception:
+            pass
+        return 0.05
+
+    def _round_to_tick(self, price: float, tick: float) -> float:
+        """Round price to nearest valid tick size."""
+        return round(round(price / tick) * tick, 4)
+
+    # =========================================================
     # ENTRY
     # =========================================================
 
@@ -146,11 +170,10 @@ class ExecutionEngine:
 
         # ── LIVE ──────────────────────────────────────────────
         entry_txn = "BUY" if side == "BUY" else "SELL"
-        limit_price = (
-            round(entry_price * 1.01 * 20) / 20
-            if side == "BUY"
-            else round(entry_price * 0.99 * 20) / 20
-        )
+        tick      = self._get_tick_size(symbol)
+        raw_limit = entry_price * 1.01 if side == "BUY" else entry_price * 0.99
+        limit_price = self._round_to_tick(raw_limit, tick)
+        self.logger.info(f"[{symbol}] Tick size: ₹{tick} | Limit price: ₹{limit_price}")
 
         entry_orderid = self.tsl.order_placement(
             tradingsymbol=symbol,
@@ -182,6 +205,18 @@ class ExecutionEngine:
             self._send_raw_alert(f"⚠️ ORDER NOT CONFIRMED — {symbol}\nNo fill returned. Trade NOT added. Check Dhan app.")
             return None
 
+        # Slippage calculation
+        actual_entry_price = float(actual_entry_price)
+        slippage_pts = actual_entry_price - entry_price if side == "BUY" else entry_price - actual_entry_price
+        slippage_pct = (slippage_pts / entry_price) * 100
+        slippage_rs  = slippage_pts * qty
+        self.logger.info(
+            f"[{symbol}] Slippage: {slippage_pts:+.2f} pts ({slippage_pct:+.3f}%) "
+            f"| Signal: ₹{entry_price} | Filled: ₹{actual_entry_price} | Cost: ₹{slippage_rs:+.2f}"
+        )
+        if abs(slippage_pct) > 0.3:
+            self.logger.warning(f"[{symbol}] HIGH SLIPPAGE: {slippage_pct:+.3f}% — low liquidity suspected")
+
         trade = ActiveTrade(
             symbol=symbol,
             side=side,
@@ -195,7 +230,7 @@ class ExecutionEngine:
             trail_sl=sl_price
         )
         self.state_manager.add_trade(trade)
-        self._send_alert("LIVE ENTRY FILLED", trade)
+        self._send_alert("LIVE ENTRY FILLED", trade, slippage_pts=slippage_pts, slippage_pct=slippage_pct)
         return trade
 
     # =========================================================

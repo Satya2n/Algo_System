@@ -179,8 +179,22 @@ def main():
                         if risk <= 0: continue
 
                         qty, risk_amount = risk_manager.calculate_position_size(entry, sl)
-                        
+
                         if qty > 0:
+                            # Liquidity impact check — soft warning only, does not block trade
+                            try:
+                                avg_bar_value = (live_df["close"] * live_df["volume"]).mean()
+                                position_value = qty * entry
+                                impact_pct = (position_value / avg_bar_value) * 100 if avg_bar_value > 0 else 0
+                                if impact_pct > 2.0:
+                                    logger.warning(
+                                        f"[{sym}] LOW LIQUIDITY WARNING: position ₹{position_value:,.0f} "
+                                        f"= {impact_pct:.1f}% of avg bar value ₹{avg_bar_value:,.0f}. "
+                                        f"Slippage risk."
+                                    )
+                            except Exception:
+                                pass
+
                             executor.place_initial_orders(sym, side, qty, entry, sl, tp1)
                             # Break out to avoid firing 3 trades in one 5-minute bar
                             break
