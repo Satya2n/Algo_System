@@ -71,6 +71,18 @@ class ExecutionEngine:
         except Exception:
             pass
 
+    def _send_raw_alert(self, message: str):
+        """Send a plain text alert not tied to a trade object."""
+        from config.credentials import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+        try:
+            self.tsl.send_telegram_alert(
+                message=message,
+                receiver_chat_id=TELEGRAM_CHAT_ID,
+                bot_token=TELEGRAM_BOT_TOKEN
+            )
+        except Exception:
+            pass
+
     def _live_market_exit(self, trade: ActiveTrade, ltp: float, reason: str) -> float:
         """Place a MARKET exit order and return executed price."""
         exit_txn = "SELL" if trade.side == "BUY" else "BUY"
@@ -152,13 +164,23 @@ class ExecutionEngine:
         )
 
         if not entry_orderid:
-            self.logger.error(f"[{symbol}] Entry order rejected.")
+            self.logger.error(f"[{symbol}] Entry order rejected by exchange.")
+            self._send_raw_alert(f"❌ ORDER REJECTED — {symbol}\nReason: Exchange rejected entry order\nPrice tried: ₹{limit_price}")
+            return None
+
+        # Wait briefly then verify order actually filled
+        pytime.sleep(1.5)
+        order_status = self.tsl.get_order_status(orderid=entry_orderid)
+        if str(order_status).upper() in {"REJECTED", "CANCELLED", "FAILED", "INVALID"}:
+            self.logger.error(f"[{symbol}] Entry order REJECTED: {order_status}")
+            self._send_raw_alert(f"❌ ORDER REJECTED — {symbol}\nStatus: {order_status}\nPrice tried: ₹{limit_price}")
             return None
 
         actual_entry_price = self.tsl.get_executed_price(orderid=entry_orderid)
         if not actual_entry_price:
-            self.logger.warning(f"[{symbol}] Could not fetch executed price, using theoretical.")
-            actual_entry_price = entry_price
+            self.logger.error(f"[{symbol}] Order placed but no fill confirmed. Aborting to prevent orphan.")
+            self._send_raw_alert(f"⚠️ ORDER NOT CONFIRMED — {symbol}\nNo fill returned. Trade NOT added. Check Dhan app.")
+            return None
 
         trade = ActiveTrade(
             symbol=symbol,
