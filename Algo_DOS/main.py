@@ -248,7 +248,7 @@ def main():
             # -------------------------------------------------
             if now_ts - last_slow_poll >= POLL_INTERVAL_SECONDS:
                 logger.info("Running slow poll for historical data & new setups...")
-                
+
                 # Fetch new historical data
                 nifty_df = tsl.get_historical_data(
                     SYMBOL,
@@ -256,10 +256,20 @@ def main():
                     TIMEFRAME,
                 )
 
-                if nifty_df is not None and not nifty_df.empty:
+                if nifty_df is None or nifty_df.empty:
+                    # Check for auth failure — attempt reconnect
+                    logger.warning("NIFTY data fetch returned empty. Attempting reconnect...")
+                    try:
+                        tsl = connect_tradehull(logger)
+                        telegram.send("⚠️ Algo_DOS: NIFTY data fetch failed. Reconnected to Dhan.")
+                        logger.info("Reconnected successfully.")
+                    except Exception as reconnect_err:
+                        logger.error(f"Reconnect failed: {reconnect_err}")
+                        telegram.send(f"❌ Algo_DOS: Reconnect FAILED. Engine not scanning!\nError: {reconnect_err}")
+                else:
                     # Run Strategy Pipeline
                     nifty_df = strategy.run_pipeline(nifty_df)
-                    
+
                     # If we aren't in a trade, evaluate the latest candle for entry
                     if executor.state.trade_mode != "IN_TRADE":
                         latest_row = nifty_df.iloc[-1]
