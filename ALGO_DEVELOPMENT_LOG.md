@@ -353,6 +353,31 @@ Add to `.gitignore` BEFORE removing from tracking.
 
 ---
 
+### 3.4 Shared Dhan Session Conflict — DH-906 Ping-Pong
+
+**Date:** 20 May 2026 | **Strategy:** Both
+
+**Symptom:**
+Both services kept invalidating each other's session every 60s. Engine
+went blind mid-session — silent failure, no Telegram alert.
+
+**Root Cause:**
+Each service had its own `Dependencies/token_YYYY-MM-DD.txt`. Every TOTP
+login creates a new server session, killing the previous one.
+
+**Fix — Shared symlink:**
+```bash
+mkdir -p ~/algo/Algo_System/shared_deps/log_files
+ln -s ~/algo/Algo_System/shared_deps Intraday.../Dependencies
+ln -s ~/algo/Algo_System/shared_deps Algo_DOS/Dependencies
+```
+Both services now share one token. One session. Zero conflict.
+
+**Lesson:** Two services on one Dhan account must share one token file.
+Stagger restarts 5 minutes apart so the first service establishes the session.
+
+---
+
 ## 4. Authentication Issues
 
 ---
@@ -460,6 +485,157 @@ if abs(slippage_pct) > 0.3:
 **Lesson:**
 Always track slippage. Include it in Telegram entry alert.
 Flag anything >0.3% as high slippage for review.
+
+---
+
+### 5.2 TP1 Not Recalculated After Actual Fill — Wrong RR on Every Trade
+
+**Date:** 20 May 2026 | **Strategy:** Intraday
+
+**Symptom:**
+JYOTHYLAB SELL — RR dropped from intended 1:1.75 to 1:0.92. Trade was
+entered with a negative RR without knowing it.
+
+**Root Cause:**
+TP1 is calculated from the signal bar close price (before fill).
+When actual fill differs due to slippage:
+- SELL trade filled lower → distance to SL increases → risk increases
+- Distance to TP1 (calculated from signal price) decreases → reward decreases
+- For JYOTHYLAB: signal ₹211.90 → fill ₹211.70 → RR became 0.61:0.66 = 0.92
+
+**Fix:**
+```python
+# After getting actual fill, recalculate TP1 to maintain 1:1.75
+actual_risk = abs(actual_entry_price - sl_price)
+if side == "BUY":
+    tp1 = actual_entry_price + (cfg.TP1_REWARD_RATIO * actual_risk)
+else:
+    tp1 = actual_entry_price - (cfg.TP1_REWARD_RATIO * actual_risk)
+```
+
+**Lesson:** Always calculate TP1 from actual fill price, not signal price.
+Slippage impacts RR doubly on SELL trades (moves fill away from TP, closer to SL).
+
+---
+
+### 5.3 Volume Score Used Session-Only Bars — Unreliable Early Morning
+
+**Date:** 20-21 May 2026 | **Strategy:** Intraday
+
+**Symptom:**
+Volume filter (score < 4 = skip) was unreliable at 09:30-10:00 AM.
+Opening rush volume inflated the session average → normal bars scored 1/10
+(false skip). Also allowed low-conviction moves to pass in some cases.
+
+**Root Cause:**
+`score_volume()` used session-only bars for the average:
+- At 09:35 with 4 bars: average includes 09:15 high-volume opening bar
+- Opening bar volume is 2-3x normal due to overnight pent-up orders
+- Inflated average makes subsequent bars look "low volume" even when they're not
+
+**Fix:**
+```python
+def score_volume(df, stock_full=None):
+    current_vol = df["volume"].iloc[-1]
+    if stock_full is not None and len(stock_full) >= 21:
+        # Use full 20-bar history (includes yesterday) — stable baseline
+        avg_vol = stock_full["volume"].iloc[-21:-1].mean()
+    else:
+        # Fallback: session-only
+        avg_vol = df["volume"].tail(21).iloc[:-1].mean()
+    rvol = current_vol / avg_vol
+    ...
+```
+`rank_stock()` updated to pass `stock_full` to `score_volume()`.
+
+**Backtest improvement (vs session-only):**
+- Win rate: 47.8% → 51.9% (+4.1%)
+- Avg R: +0.461 → +0.543 (+18%)
+- Profit Factor: 1.90 → 2.15 (+0.25)
+
+**Lesson:** Volume baseline must use stable historical data, not just today's
+opening bars. Session-only average is unreliable for the first 30-45 minutes.
+
+---
+
+### 5.4 Score Threshold at Noise Boundary — SKIP Signals Firing
+
+**Date:** 20 May 2026 | **Strategy:** Intraday
+
+**Symptom:**
+4 of 7 trades today showed SKIP (score < 70) when re-analysed post-market,
+yet the live engine fired them. PFC (69.1), TATAELXSI (67.8),
+MOTHERSON (64.6), COFORGE (52.6) all traded.
+
+**Root Cause:**
+Live Dhan data (real-time) differs slightly from historical data (finalized):
+1. Intraday bars finalize after bar close — values can shift 0.1-0.5%
+2. EMA calculations differ with full-day data vs 3-months-to-signal data
+3. RVOL lookback window changes as session bars accumulate
+These differences cause ±2-3 point fluctuations in score around the threshold.
+A score of 70 live can appear as 67-73 post-market.
+
+**Fix:**
+Raised threshold 70 → 72 to create a 2-point buffer above the noise zone.
+
+**Lesson:** Set signal thresholds above the noise level of the scoring system.
+If live data vs finalized data causes ±3 point swings, the threshold must be
+at least 3 points above the minimum acceptable quality level.
+
+---
+
+### 5.5 Gap-Down Regime — False SHORT Signals in First 45 Minutes
+
+**Date:** 20 May 2026 | **Strategy:** Intraday
+
+**Symptom:**
+NIFTY gapped down -0.63% then recovered all day. Strategy fired 4 SHORT
+signals (PFC, JYOTHYLAB, JUBLFOOD, TATAELXSI) while NIFTY was rising.
+All 4 lost.
+
+**Root Cause:**
+On gap-down recovery days, ALL stocks start below yesterday's close.
+RS calculation uses session return (from today's open), so stocks that
+gapped down MORE than NIFTY look "weak" even if both are recovering.
+The strategy sees negative RS → SHORT signal → but market is going UP.
+
+**Suggested Fix (not yet implemented):**
+```python
+# In main.py slow loop, before scanning
+gap_pct = (nifty_open - nifty_prev_close) / nifty_prev_close * 100
+nifty_recovering = nifty_session_return > 0
+
+if gap_pct < -0.3 and nifty_recovering:
+    # Skip SHORT signals for first 45 minutes
+    if current_time < time(10, 0):
+        if signal == "ENTER_SHORT":
+            continue
+```
+
+**Lesson:** Always check NIFTY regime before allowing directional signals.
+Gap-down + recovery days create false SHORT signals in the first 30-45 minutes.
+
+---
+
+### 5.6 Extension Filter Missing — Entering After Surge
+
+**Date:** 20 May 2026 | **Strategy:** Intraday
+
+**Symptom:**
+MOTHERSON +1.47% from open, COFORGE +2.27% from open at time of entry.
+Both reversed immediately after entry. Strategy entered at the TOP of
+the initial gap-recovery surge, not a genuine pullback.
+
+**Suggested Fix (not yet implemented):**
+```python
+# Before placing entry
+session_return = (latest["close"] - session_open) / session_open * 100
+if abs(session_return) > 1.0:
+    continue  # already extended — real pullback entries don't happen here
+```
+
+**Lesson:** Pullback strategy requires the stock to actually PULL BACK.
+If it's already moved >1% from open, you're entering on extension, not pullback.
 
 ---
 
@@ -731,6 +907,31 @@ Risk per trade → HARD CAP (qty calculation)
 | May 2026 | Algo_DOS | Detailed Telegram entry alert | Only showed symbol + credit before |
 | May 2026 | Both | Atomic state writes (tmp + rename) | Crash mid-write corrupts JSON |
 | May 2026 | Both | `validate_spread()` called in Algo_DOS | Risk checks existed but were never called |
+| 20 May 2026 | Both | Shared Dependencies/ symlink for token | Two services invalidating each other's Dhan session every 60s |
+| 20 May 2026 | Intraday | Score threshold 70 → 72 | Borderline scores (69-72) fired due to live vs finalized data noise |
+| 20 May 2026 | Intraday | Volume filter: skip if score < 4 | Low-volume signals (RVOL < 0.8x) have no conviction and reverse |
+| 20 May 2026 | Intraday | TP1 recalculated from actual fill price | Signal-based TP1 broke RR when slippage occurred (1:1.75 → 1:0.92) |
+| 20 May 2026 | Intraday | Robust retry: 3 attempts for entry + exit | Single attempt failures created orphan trades or missed exits |
+| 20 May 2026 | Intraday | Order rejection → Telegram alert + abort | Silent failures allowed orphan positions (JKCEMENT naked short) |
+| 21 May 2026 | Intraday | Volume score uses full 20-bar history | Session-only baseline inflated by opening rush → unreliable RVOL |
+| 21 May 2026 | Intraday | MAX_STOCKS 12 → 15 | More opportunity without quality compromise |
+| 21 May 2026 | Intraday | New watchlist from full-history backtest | 48% avg_R improvement: +0.366 → +0.543, win rate 46.6% → 51.9% |
+
+---
+
+## 10. Backtest Lessons — Intraday Strategy
+
+### What Worked
+- Score threshold 72 + volume filter ≥4 + full historical baseline: 48% better avg_R
+- Full 20-bar historical volume baseline is significantly more accurate than session-only
+- Raising threshold filters noise without sacrificing good signals
+- Fewer, higher-quality trades outperforms many mediocre ones
+
+### What to Investigate Next
+- Gap-down regime filter (block SHORTs in first 45 min on recovery days)
+- Extension filter (skip if stock already moved >1% from open)
+- Per-stock direction bias (some stocks work LONG only, some SHORT only)
+- Score calculation based on real-time LTP vs closed bar (30-60s lag)
 
 ---
 
