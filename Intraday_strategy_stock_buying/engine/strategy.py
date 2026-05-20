@@ -440,9 +440,9 @@ def rank_stock(stock_full: pd.DataFrame, nifty_full: pd.DataFrame):
         0.5 * volat_score
     )
 
-    if long_score >= 70 and long_score > short_score + 10:
+    if long_score >= 72 and long_score > short_score + 10:
         decision = "LONG"
-    elif short_score >= 70 and short_score > long_score + 10:
+    elif short_score >= 72 and short_score > long_score + 10:
         decision = "SHORT"
     else:
         decision = "SKIP"

@@ -175,6 +175,11 @@ def main():
                     rank_result = rank_stock(stock_full, nifty_full)
                     if not rank_result: continue
                     decision = rank_result.get("decision", "SKIP")
+
+                    # Volume filter — skip if < 4/10 (RVOL < 0.8x, no conviction)
+                    if rank_result.get("volume_score", 0) < 4:
+                        logger.info(f"[{sym}] Skipped — low volume ({rank_result['volume_score']}/10)")
+                        continue
                     
                     signal = "NO_TRADE"
                     if decision == "LONG":

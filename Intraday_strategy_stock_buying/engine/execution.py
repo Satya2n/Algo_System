@@ -309,13 +309,25 @@ class ExecutionEngine:
         if abs(slippage_pct) > 0.3:
             self.logger.warning(f"[{symbol}] HIGH SLIPPAGE: {slippage_pct:+.3f}% — low liquidity suspected")
 
+        # Recalculate TP1 from actual fill price to maintain correct 1:1.75 RR
+        # Using signal price gives wrong RR when fill differs due to slippage
+        actual_risk = abs(actual_entry_price - sl_price)
+        if actual_risk > 0:
+            tp1_actual = actual_entry_price + (cfg.TP1_REWARD_RATIO * actual_risk) if side == "BUY" \
+                    else actual_entry_price - (cfg.TP1_REWARD_RATIO * actual_risk)
+            self.logger.info(
+                f"[{symbol}] TP1 adjusted: ₹{tp1:.2f} → ₹{tp1_actual:.2f} "
+                f"(fill ₹{actual_entry_price} | risk ₹{actual_risk:.2f} | RR 1:{cfg.TP1_REWARD_RATIO})"
+            )
+            tp1 = tp1_actual
+
         trade = ActiveTrade(
             symbol=symbol,
             side=side,
             qty=qty,
-            entry_price=float(actual_entry_price),
+            entry_price=actual_entry_price,
             entry_order_id=entry_orderid,
-            sl_order_id="SOFTWARE_SL",   # SL monitored in software, not on exchange
+            sl_order_id="SOFTWARE_SL",
             stop_loss=sl_price,
             tp1=tp1,
             remaining_qty=qty,
