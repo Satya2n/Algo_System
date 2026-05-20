@@ -86,25 +86,39 @@ class ExecutionEngine:
             pass
 
     def _live_market_exit(self, trade: ActiveTrade, ltp: float, reason: str) -> float:
-        """Place a MARKET exit order and return executed price."""
+        """Place a MARKET exit order and return executed price. Retries once on failure."""
         exit_txn = "SELL" if trade.side == "BUY" else "BUY"
-        try:
-            exit_orderid = self.tsl.order_placement(
-                tradingsymbol=trade.symbol,
-                exchange="NSE",
-                quantity=trade.qty,
-                price=0,
-                trigger_price=0,
-                order_type="MARKET",
-                transaction_type=exit_txn,
-                trade_type="MIS"
-            )
-            exit_price = self.tsl.get_executed_price(orderid=exit_orderid)
-            if exit_price:
-                return float(exit_price)
-        except Exception as e:
-            self.logger.error(f"[{trade.symbol}] Market exit failed: {e}")
-        return ltp  # fallback to LTP if fetch fails
+
+        for attempt in range(1, 3):  # try twice
+            try:
+                exit_orderid = self.tsl.order_placement(
+                    tradingsymbol=trade.symbol,
+                    exchange="NSE",
+                    quantity=trade.qty,
+                    price=0,
+                    trigger_price=0,
+                    order_type="MARKET",
+                    transaction_type=exit_txn,
+                    trade_type="MIS"
+                )
+                if exit_orderid:
+                    exit_price = self.tsl.get_executed_price(orderid=exit_orderid)
+                    if exit_price:
+                        return float(exit_price)
+            except Exception as e:
+                self.logger.error(f"[{trade.symbol}] Market exit attempt {attempt} failed: {e}")
+                if attempt == 1:
+                    pytime.sleep(1)  # brief pause before retry
+
+        # Both attempts failed — alert user to close manually
+        self.logger.critical(f"[{trade.symbol}] EXIT FAILED TWICE. CLOSE MANUALLY IN DHAN APP!")
+        self._send_raw_alert(
+            f"🚨 EXIT FAILED — {trade.symbol}\n"
+            f"Reason: {reason}\n"
+            f"CLOSE MANUALLY IN DHAN APP NOW!\n"
+            f"Side: {trade.side} | Qty: {trade.qty}"
+        )
+        return ltp
 
     # =========================================================
     # TICK SIZE HELPER
