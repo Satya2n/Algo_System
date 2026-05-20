@@ -85,38 +85,91 @@ class ExecutionEngine:
         except Exception:
             pass
 
+    def _reconnect(self):
+        """Attempt fresh TOTP login and refresh tsl connection."""
+        try:
+            from config.credentials import (
+                DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, DHAN_PIN, DHAN_TOTP_SECRET
+            )
+            import os
+            from datetime import date as _date
+            token_file = os.path.join("Dependencies", f"token_{_date.today()}.txt")
+            if os.path.exists(token_file):
+                os.remove(token_file)
+            from Dhan_Tradehull import Tradehull
+            if DHAN_ACCESS_TOKEN:
+                self.tsl = Tradehull(DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, mode="access_token")
+            else:
+                self.tsl = Tradehull(DHAN_CLIENT_CODE, mode="pin_totp",
+                                     pin=DHAN_PIN, totp_secret=DHAN_TOTP_SECRET)
+            self.logger.info("ExecutionEngine reconnected to Dhan.")
+            return True
+        except Exception as e:
+            self.logger.error(f"Reconnect failed: {e}")
+            return False
+
+    def _place_order(self, symbol, qty, price, trigger_price, order_type, txn_type):
+        """Single order placement call."""
+        return self.tsl.order_placement(
+            tradingsymbol=symbol, exchange="NSE", quantity=qty,
+            price=price, trigger_price=trigger_price,
+            order_type=order_type, transaction_type=txn_type, trade_type="MIS"
+        )
+
     def _live_market_exit(self, trade: ActiveTrade, ltp: float, reason: str) -> float:
-        """Place a MARKET exit order and return executed price. Retries once on failure."""
-        exit_txn = "SELL" if trade.side == "BUY" else "BUY"
+        """
+        Exit with 3 attempts:
+          1. MARKET order
+          2. MARKET order after reconnect (2s wait)
+          3. LIMIT order at 1% favorable price (3s wait)
+        If all 3 fail → urgent Telegram alert to close manually.
+        """
+        exit_txn  = "SELL" if trade.side == "BUY" else "BUY"
+        tick      = self._get_tick_size(trade.symbol)
 
-        for attempt in range(1, 3):  # try twice
+        attempts = [
+            ("MARKET", 0,     0),
+            ("MARKET", 0,     0),     # retry after reconnect
+            ("LIMIT",  None,  0),     # limit with buffer — set below
+        ]
+
+        for i, (order_type, price, _) in enumerate(attempts, 1):
+            # Set limit price for attempt 3
+            if order_type == "LIMIT":
+                if exit_txn == "SELL":
+                    price = self._round_to_tick(ltp * 0.99, tick)  # below market
+                else:
+                    price = self._round_to_tick(ltp * 1.01, tick)  # above market
+
             try:
-                exit_orderid = self.tsl.order_placement(
-                    tradingsymbol=trade.symbol,
-                    exchange="NSE",
-                    quantity=trade.qty,
-                    price=0,
-                    trigger_price=0,
-                    order_type="MARKET",
-                    transaction_type=exit_txn,
-                    trade_type="MIS"
+                self.logger.info(f"[{trade.symbol}] Exit attempt {i}/3 | {order_type} | price={price or 'MKT'}")
+                order_id = self._place_order(
+                    trade.symbol, trade.qty, price or 0, 0, order_type, exit_txn
                 )
-                if exit_orderid:
-                    exit_price = self.tsl.get_executed_price(orderid=exit_orderid)
+                if order_id:
+                    exit_price = self.tsl.get_executed_price(orderid=order_id)
                     if exit_price:
+                        self.logger.info(f"[{trade.symbol}] Exit filled at ₹{exit_price} (attempt {i})")
                         return float(exit_price)
-            except Exception as e:
-                self.logger.error(f"[{trade.symbol}] Market exit attempt {attempt} failed: {e}")
-                if attempt == 1:
-                    pytime.sleep(1)  # brief pause before retry
 
-        # Both attempts failed — alert user to close manually
-        self.logger.critical(f"[{trade.symbol}] EXIT FAILED TWICE. CLOSE MANUALLY IN DHAN APP!")
+            except Exception as e:
+                self.logger.error(f"[{trade.symbol}] Exit attempt {i} failed: {e}")
+
+            # Between attempts
+            if i == 1:
+                pytime.sleep(2)
+                self._reconnect()
+            elif i == 2:
+                pytime.sleep(3)
+
+        # All 3 failed
+        self.logger.critical(f"[{trade.symbol}] ALL EXIT ATTEMPTS FAILED. MANUAL ACTION REQUIRED!")
         self._send_raw_alert(
-            f"🚨 EXIT FAILED — {trade.symbol}\n"
-            f"Reason: {reason}\n"
-            f"CLOSE MANUALLY IN DHAN APP NOW!\n"
-            f"Side: {trade.side} | Qty: {trade.qty}"
+            f"🚨 URGENT — EXIT FAILED 3 TIMES\n"
+            f"Stock    : {trade.symbol}\n"
+            f"Reason   : {reason}\n"
+            f"Side     : {trade.side} | Qty: {trade.qty}\n"
+            f"Action   : CLOSE MANUALLY IN DHAN APP NOW!"
         )
         return ltp
 
@@ -194,34 +247,54 @@ class ExecutionEngine:
         limit_price = self._round_to_tick(raw_limit, tick)
         self.logger.info(f"[{symbol}] Tick size: ₹{tick} | Limit price: ₹{limit_price}")
 
-        entry_orderid = self.tsl.order_placement(
-            tradingsymbol=symbol,
-            exchange="NSE",
-            quantity=qty,
-            price=limit_price,
-            trigger_price=0,
-            order_type="LIMIT",
-            transaction_type=entry_txn,
-            trade_type="MIS"
-        )
+        # ── Entry with retry ──────────────────────────────────
+        # Attempt 1: LIMIT order
+        # Attempt 2: LIMIT order after reconnect
+        # Attempt 3: MARKET order (guaranteed fill if market open)
+        entry_orderid    = None
+        actual_entry_price = None
 
-        if not entry_orderid:
-            self.logger.error(f"[{symbol}] Entry order rejected by exchange.")
-            self._send_raw_alert(f"❌ ORDER REJECTED — {symbol}\nReason: Exchange rejected entry order\nPrice tried: ₹{limit_price}")
-            return None
+        entry_attempts = [
+            ("LIMIT",  limit_price),
+            ("LIMIT",  limit_price),   # after reconnect
+            ("MARKET", 0),             # fallback to market
+        ]
 
-        # Wait briefly then verify order actually filled
-        pytime.sleep(1.5)
-        order_status = self.tsl.get_order_status(orderid=entry_orderid)
-        if str(order_status).upper() in {"REJECTED", "CANCELLED", "FAILED", "INVALID"}:
-            self.logger.error(f"[{symbol}] Entry order REJECTED: {order_status}")
-            self._send_raw_alert(f"❌ ORDER REJECTED — {symbol}\nStatus: {order_status}\nPrice tried: ₹{limit_price}")
-            return None
+        for attempt_num, (order_type, price) in enumerate(entry_attempts, 1):
+            try:
+                self.logger.info(f"[{symbol}] Entry attempt {attempt_num}/3 | {order_type} @ ₹{price or 'MKT'}")
+                entry_orderid = self._place_order(symbol, qty, price, 0, order_type, entry_txn)
 
-        actual_entry_price = self.tsl.get_executed_price(orderid=entry_orderid)
+                if not entry_orderid:
+                    raise ValueError("No order ID returned")
+
+                pytime.sleep(1.5)
+                order_status = self.tsl.get_order_status(orderid=entry_orderid)
+                if str(order_status).upper() in {"REJECTED", "CANCELLED", "FAILED", "INVALID"}:
+                    raise ValueError(f"Order status: {order_status}")
+
+                actual_entry_price = self.tsl.get_executed_price(orderid=entry_orderid)
+                if actual_entry_price:
+                    break  # success
+
+            except Exception as e:
+                self.logger.warning(f"[{symbol}] Entry attempt {attempt_num} failed: {e}")
+                entry_orderid = None
+                actual_entry_price = None
+
+                if attempt_num == 1:
+                    pytime.sleep(2)
+                    self._reconnect()
+                elif attempt_num == 2:
+                    pytime.sleep(2)
+
         if not actual_entry_price:
-            self.logger.error(f"[{symbol}] Order placed but no fill confirmed. Aborting to prevent orphan.")
-            self._send_raw_alert(f"⚠️ ORDER NOT CONFIRMED — {symbol}\nNo fill returned. Trade NOT added. Check Dhan app.")
+            self.logger.error(f"[{symbol}] All 3 entry attempts failed. Trade skipped.")
+            self._send_raw_alert(
+                f"❌ ENTRY FAILED — {symbol}\n"
+                f"All 3 attempts failed (LIMIT×2 + MARKET)\n"
+                f"Trade NOT placed. Check Dhan app."
+            )
             return None
 
         # Slippage calculation
