@@ -99,6 +99,19 @@ def main():
             active_trades = list(state_manager.state.active_trades.values())
             if active_trades:
                 all_ltp = tsl.get_ltp_data(names=[t.symbol for t in active_trades])
+                if not all_ltp:
+                    logger.warning("LTP fetch failed — attempting reconnect...")
+                    try:
+                        import os
+                        token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
+                        if os.path.exists(token_file):
+                            os.remove(token_file)
+                        tsl = connect_tradehull()
+                        logger.info("Reconnected successfully.")
+                    except Exception as re:
+                        logger.error(f"Reconnect failed: {re}")
+                    time.sleep(cfg.FAST_POLL_INTERVAL_SECONDS)
+                    continue
                 for trade in active_trades:
                     ltp = all_ltp.get(trade.symbol)
                     if not ltp: continue
@@ -132,6 +145,16 @@ def main():
                 logger.info("Running slow poll for setups...")
                 nifty_full = tsl.get_historical_data(tradingsymbol="NIFTY", exchange="INDEX", timeframe="5")
                 if nifty_full is None or len(nifty_full) == 0:
+                    logger.warning("NIFTY data empty — token may be invalid. Attempting reconnect...")
+                    try:
+                        import os
+                        token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
+                        if os.path.exists(token_file):
+                            os.remove(token_file)
+                        tsl = connect_tradehull()
+                        logger.info("Reconnected successfully.")
+                    except Exception as re:
+                        logger.error(f"Reconnect failed: {re}")
                     continue
 
                 for sym in watchlist:
