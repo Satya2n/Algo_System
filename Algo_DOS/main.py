@@ -154,13 +154,14 @@ def main():
     # -------------------------------------------------
     # FETCH HISTORICAL DATA
     # -------------------------------------------------
+    import time as time_module
     nifty_df = None
     for attempt in range(3):
         nifty_df = tsl.get_historical_data(SYMBOL, EXCHANGE, TIMEFRAME)
         if nifty_df is not None and not nifty_df.empty:
             break
         logger.warning(f"Initial data fetch failed (attempt {attempt+1}/3). Retrying in 30s...")
-        time.sleep(30)
+        time_module.sleep(30)
         try:
             tsl = connect_tradehull(logger)
         except Exception:
