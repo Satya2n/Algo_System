@@ -257,15 +257,15 @@ def main():
                 )
 
                 if nifty_df is None or nifty_df.empty:
-                    # Check for auth failure — attempt reconnect
-                    logger.warning("NIFTY data fetch returned empty. Attempting reconnect...")
+                    # Wait 5 minutes before reconnecting — prevents ping-pong
+                    # with Intraday service stealing each other's Dhan session
+                    logger.warning("NIFTY data fetch empty. Waiting 5 min before reconnect (session conflict protection)...")
+                    time.sleep(300)
                     try:
                         tsl = connect_tradehull(logger)
-                        telegram.send("⚠️ Algo_DOS: NIFTY data fetch failed. Reconnected to Dhan.")
                         logger.info("Reconnected successfully.")
                     except Exception as reconnect_err:
                         logger.error(f"Reconnect failed: {reconnect_err}")
-                        telegram.send(f"❌ Algo_DOS: Reconnect FAILED. Engine not scanning!\nError: {reconnect_err}")
                 else:
                     # Run Strategy Pipeline
                     nifty_df = strategy.run_pipeline(nifty_df)
