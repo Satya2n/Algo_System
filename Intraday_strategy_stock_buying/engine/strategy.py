@@ -291,21 +291,34 @@ def trend_score_short(df: pd.DataFrame) -> float:
     return 0.35 * ema + 0.25 * swing + 0.25 * body + 0.15 * wick
 
 
-def score_volume(df: pd.DataFrame) -> int:
+def score_volume(df: pd.DataFrame, stock_full: pd.DataFrame = None) -> int:
     """
-    Simple fallback RVOL-like score using recent candles.
+    RVOL score comparing current bar volume against a stable 20-bar baseline.
+
+    If stock_full is provided: uses last 20 bars from full history (including
+    yesterday) for a stable, accurate baseline — not affected by opening rush.
+
+    If stock_full not provided: falls back to session-only average.
     """
     if len(df) < 5:
         return 0
 
-    current_vol = df["volume"].iloc[-1]
-    lookback = min(20, len(df) - 1)
+    current_vol = float(df["volume"].iloc[-1])
 
-    if lookback < 3:
+    if stock_full is not None and len(stock_full) >= 21:
+        # Full 20-bar historical baseline — stable, includes yesterday
+        avg_vol = float(stock_full["volume"].iloc[-21:-1].mean())
+    else:
+        # Fallback: session-only average
+        lookback = min(20, len(df) - 1)
+        if lookback < 3:
+            return 0
+        avg_vol = float(df["volume"].tail(lookback + 1).iloc[:-1].mean())
+
+    if avg_vol <= 0:
         return 0
 
-    avg_vol = df["volume"].tail(lookback + 1).iloc[:-1].mean()
-    rvol = current_vol / avg_vol if avg_vol and avg_vol != 0 else 0
+    rvol = current_vol / avg_vol
 
     if rvol > 2.5:
         return 10
@@ -416,7 +429,7 @@ def rank_stock(stock_full: pd.DataFrame, nifty_full: pd.DataFrame):
     trend_long = trend_score_long(merged)
     trend_short = trend_score_short(merged)
 
-    vol_score = score_volume(merged)
+    vol_score = score_volume(merged, stock_full=stock_full)
     volat_score = score_volatility(latest["atr_pct"])
 
     gap_long = score_vwap_long(gap_pct)

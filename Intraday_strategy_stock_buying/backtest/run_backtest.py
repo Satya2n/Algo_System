@@ -79,7 +79,7 @@ logger = logging.getLogger("BACKTEST")
 MIN_TRADES        = 8      # ignore stocks with fewer signals (too thin)
 MIN_PROFIT_FACTOR = 1.2    # at least 20% more wins than losses by value
 MIN_AVG_R         = 0.05   # average R-multiple must be positive & meaningful
-MAX_STOCKS        = 12     # top 12 only — matches MAX_CONCURRENT_TRADES = 5
+MAX_STOCKS        = 15     # top 15 stocks
 
 # ── simulation settings ───────────────────────────────────────────────────────
 TP1_RR           = 1.75   # matches live engine TP1_REWARD_RATIO
@@ -296,6 +296,22 @@ def backtest_symbol(symbol: str, stock_df, nifty_df) -> tuple[list, dict]:
 
         rank = rank_stock(stock_slice, nifty_slice)
         if not rank or rank["decision"] == "SKIP":
+            continue
+
+        # Volume filter — using FULL historical 20-bar average (not session-only)
+        # This is more stable than session-only average (especially early morning)
+        if i >= 20:
+            current_vol = float(stock.iloc[i]["volume"])
+            hist_avg_vol = stock["volume"].iloc[i-20:i].mean()
+            rvol_full = current_vol / hist_avg_vol if hist_avg_vol > 0 else 0
+            vol_score_full = (10 if rvol_full > 2.5 else
+                              8  if rvol_full > 1.5 else
+                              6  if rvol_full > 1.2 else
+                              4  if rvol_full > 0.8 else 1)
+        else:
+            vol_score_full = rank.get("volume_score", 0)
+
+        if vol_score_full < 4:
             continue
 
         live_df = prepare_live_df(stock_slice)
