@@ -154,16 +154,24 @@ def main():
     # -------------------------------------------------
     # FETCH HISTORICAL DATA
     # -------------------------------------------------
-    nifty_df = tsl.get_historical_data(
-        SYMBOL,
-        EXCHANGE,
-        TIMEFRAME,
-    )
+    nifty_df = None
+    for attempt in range(3):
+        nifty_df = tsl.get_historical_data(SYMBOL, EXCHANGE, TIMEFRAME)
+        if nifty_df is not None and not nifty_df.empty:
+            break
+        logger.warning(f"Initial data fetch failed (attempt {attempt+1}/3). Retrying in 30s...")
+        time.sleep(30)
+        try:
+            tsl = connect_tradehull(logger)
+        except Exception:
+            pass
 
     if nifty_df is None or nifty_df.empty:
-        raise RuntimeError("Historical data fetch failed.")
+        logger.warning("Could not fetch initial data. Will retry in main loop.")
+        nifty_df = None
 
-    logger.info(f"{SYMBOL} rows fetched: {len(nifty_df)}")
+    if nifty_df is not None:
+        logger.info(f"{SYMBOL} rows fetched: {len(nifty_df)}")
 
     # -------------------------------------------------
     # STRATEGY CONFIG
