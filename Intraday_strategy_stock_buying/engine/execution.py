@@ -125,15 +125,20 @@ class ExecutionEngine:
     # =========================================================
 
     def _get_tick_size(self, symbol: str) -> float:
-        """Fetch tick size from Dhan instrument file. Defaults to ₹0.05."""
+        """
+        Fetch tick size from Dhan instrument file.
+        SEM_TICK_SIZE is stored in PAISE — divide by 100 to get rupees.
+        Example: SEM_TICK_SIZE=5 → 5 paise → ₹0.05 (standard NSE equity tick)
+        """
         try:
             inst = getattr(self.tsl, "instrument_df", None)
             if inst is not None and not inst.empty:
                 row = inst[inst["SEM_TRADING_SYMBOL"] == symbol]
                 if not row.empty:
-                    tick = float(row.iloc[0].get("SEM_TICK_SIZE", 0.05))
-                    if tick > 0:
-                        return tick
+                    tick_paise = float(row.iloc[0].get("SEM_TICK_SIZE", 5.0))
+                    tick_rs = tick_paise / 100.0  # paise → rupees
+                    if tick_rs > 0:
+                        return tick_rs
         except Exception:
             pass
         return 0.05
@@ -306,7 +311,7 @@ class ExecutionEngine:
                 if trade.side == "BUY"
                 else (trade.entry_price - exit_price) * trade.qty
             )
-            self.logger.info(f"[{trade.symbol}] LIVE SL HIT at {exit_price}. MARKET exit placed.")
+            self.logger.info(f"[{trade.symbol}] LIVE SL HIT at {exit_price}. Exit order sent.")
             self._send_alert("LIVE SL HIT", trade)
             return trade, True
 
@@ -322,7 +327,7 @@ class ExecutionEngine:
                 if trade.side == "BUY"
                 else (trade.entry_price - exit_price) * trade.qty
             )
-            self.logger.info(f"[{trade.symbol}] LIVE TP1 HIT at {exit_price}. MARKET exit placed.")
+            self.logger.info(f"[{trade.symbol}] LIVE TP1 HIT at {exit_price}. Exit order sent.")
             self._send_alert("LIVE TP1 FULL EXIT", trade)
             return trade, True
 
