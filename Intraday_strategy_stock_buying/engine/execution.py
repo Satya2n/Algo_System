@@ -11,12 +11,12 @@ class ExecutionEngine:
         self.tsl = tsl
         self.state_manager = state_manager
         self.logger = logging.getLogger("ExecutionEngine")
+        self._exit_alert_sent = set()  # track symbols where exit-fail alert already sent
 
     def _mock_order_id(self, prefix: str) -> str:
         return f"{prefix}_{int(pytime.time() * 1000)}"
 
     def _send_alert(self, title: str, trade: ActiveTrade, slippage_pts: float = 0.0, slippage_pct: float = 0.0):
-        from config.credentials import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
         try:
             is_entry = "ENTRY" in title
             is_sl    = "SL" in title
@@ -25,51 +25,43 @@ class ExecutionEngine:
 
             if is_entry:
                 direction = "LONG (BUY)" if trade.side == "BUY" else "SHORT (SELL)"
-                slip_flag = f"⚠️ High" if abs(slippage_pct) > 0.3 else "✅ Normal"
+                slip_flag = "High" if abs(slippage_pct) > 0.3 else "Normal"
                 msg = (
-                    f"🚀 ENTRY — {trade.symbol}\n"
-                    f"──────────────────\n"
+                    f"ENTRY - {trade.symbol}\n"
                     f"Direction : {direction}\n"
                     f"Qty       : {trade.qty}\n"
-                    f"Entry     : ₹{trade.entry_price:.2f}\n"
-                    f"Stop Loss : ₹{trade.stop_loss:.2f}\n"
-                    f"Target    : ₹{trade.tp1:.2f}\n"
-                    f"Risk/Reward: 1:1.75\n"
+                    f"Entry     : Rs{trade.entry_price:.2f}\n"
+                    f"Stop Loss : Rs{trade.stop_loss:.2f}\n"
+                    f"Target    : Rs{trade.tp1:.2f}\n"
+                    f"RR        : 1:1.75\n"
                     f"Slippage  : {slippage_pts:+.2f} pts ({slippage_pct:+.3f}%) {slip_flag}"
                 )
             elif is_tp:
                 msg = (
-                    f"✅ TARGET HIT — {trade.symbol}\n"
-                    f"──────────────────\n"
+                    f"TARGET HIT - {trade.symbol}\n"
                     f"Qty   : {trade.qty}\n"
-                    f"Entry : ₹{trade.entry_price:.2f}\n"
-                    f"Target: ₹{trade.tp1:.2f}\n"
-                    f"PnL   : ₹{trade.pnl:.2f}"
+                    f"Entry : Rs{trade.entry_price:.2f}\n"
+                    f"Target: Rs{trade.tp1:.2f}\n"
+                    f"PnL   : Rs{trade.pnl:.2f}"
                 )
             elif is_sl:
                 msg = (
-                    f"❌ STOP LOSS HIT — {trade.symbol}\n"
-                    f"──────────────────\n"
+                    f"STOP LOSS HIT - {trade.symbol}\n"
                     f"Qty   : {trade.qty}\n"
-                    f"Entry : ₹{trade.entry_price:.2f}\n"
-                    f"SL    : ₹{trade.stop_loss:.2f}\n"
-                    f"PnL   : ₹{trade.pnl:.2f}"
+                    f"Entry : Rs{trade.entry_price:.2f}\n"
+                    f"SL    : Rs{trade.stop_loss:.2f}\n"
+                    f"PnL   : Rs{trade.pnl:.2f}"
                 )
             elif is_sq:
                 msg = (
-                    f"⏹ FORCE EXIT — {trade.symbol}\n"
-                    f"──────────────────\n"
+                    f"FORCE EXIT - {trade.symbol}\n"
                     f"Qty : {trade.qty}\n"
-                    f"PnL : ₹{trade.pnl:.2f}"
+                    f"PnL : Rs{trade.pnl:.2f}"
                 )
             else:
                 msg = f"[{title}] {trade.symbol}"
 
-            self.tsl.send_telegram_alert(
-                message=msg,
-                receiver_chat_id=TELEGRAM_CHAT_ID,
-                bot_token=TELEGRAM_BOT_TOKEN
-            )
+            self._send_raw_alert(msg)
         except Exception:
             pass
 
@@ -98,62 +90,43 @@ class ExecutionEngine:
             order_type=order_type, transaction_type=txn_type, trade_type="MIS"
         )
 
-    def _live_market_exit(self, trade: ActiveTrade, ltp: float, reason: str) -> float:
+    def _live_market_exit(self, trade: ActiveTrade, ltp: float, reason: str) -> Optional[float]:
         """
-        Exit with 3 attempts:
-          1. MARKET order
-          2. MARKET order after reconnect (2s wait)
-          3. LIMIT order at 1% favorable price (3s wait)
-        If all 3 fail → urgent Telegram alert to close manually.
+        Single MARKET exit attempt.
+        - Order placed and fill confirmed  → return fill price, clear alert flag
+        - Order placed, fill not confirmed → return ltp as approximation (order IS in market)
+        - Order placement failed entirely  → return None, send URGENT alert once
+          On None: trade stays in state, fast loop retries every 5 seconds.
         """
-        exit_txn  = "SELL" if trade.side == "BUY" else "BUY"
-        tick      = self._get_tick_size(trade.symbol)
+        exit_txn = "SELL" if trade.side == "BUY" else "BUY"
+        try:
+            self.logger.info(f"[{trade.symbol}] Exit | MARKET | reason={reason}")
+            order_id = self._place_order(trade.symbol, trade.qty, 0, 0, "MARKET", exit_txn)
+            if order_id:
+                pytime.sleep(1)
+                exit_price = self.tsl.get_executed_price(orderid=order_id)
+                self._exit_alert_sent.discard(trade.symbol)
+                if exit_price:
+                    self.logger.info(f"[{trade.symbol}] Exit filled at ₹{exit_price}")
+                    return float(exit_price)
+                # Order placed but fill not yet confirmed — use ltp to avoid double exit
+                self.logger.warning(f"[{trade.symbol}] Exit placed but fill unconfirmed. Using LTP ₹{ltp}")
+                return float(ltp)
+        except Exception as e:
+            self.logger.error(f"[{trade.symbol}] Exit failed: {e}")
 
-        attempts = [
-            ("MARKET", 0,     0),
-            ("MARKET", 0,     0),     # retry after reconnect
-            ("LIMIT",  None,  0),     # limit with buffer — set below
-        ]
-
-        for i, (order_type, price, _) in enumerate(attempts, 1):
-            # Set limit price for attempt 3
-            if order_type == "LIMIT":
-                if exit_txn == "SELL":
-                    price = self._round_to_tick(ltp * 0.99, tick)  # below market
-                else:
-                    price = self._round_to_tick(ltp * 1.01, tick)  # above market
-
-            try:
-                self.logger.info(f"[{trade.symbol}] Exit attempt {i}/3 | {order_type} | price={price or 'MKT'}")
-                order_id = self._place_order(
-                    trade.symbol, trade.qty, price or 0, 0, order_type, exit_txn
-                )
-                if order_id:
-                    exit_price = self.tsl.get_executed_price(orderid=order_id)
-                    if exit_price:
-                        self.logger.info(f"[{trade.symbol}] Exit filled at ₹{exit_price} (attempt {i})")
-                        return float(exit_price)
-
-            except Exception as e:
-                self.logger.error(f"[{trade.symbol}] Exit attempt {i} failed: {e}")
-
-            # Between attempts
-            if i == 1:
-                pytime.sleep(2)
-                self._reconnect()
-            elif i == 2:
-                pytime.sleep(3)
-
-        # All 3 failed
-        self.logger.critical(f"[{trade.symbol}] ALL EXIT ATTEMPTS FAILED. MANUAL ACTION REQUIRED!")
-        self._send_raw_alert(
-            f"🚨 URGENT — EXIT FAILED 3 TIMES\n"
-            f"Stock    : {trade.symbol}\n"
-            f"Reason   : {reason}\n"
-            f"Side     : {trade.side} | Qty: {trade.qty}\n"
-            f"Action   : CLOSE MANUALLY IN DHAN APP NOW!"
-        )
-        return ltp
+        # Order placement failed — keep trade in state, retry next 5s cycle
+        self.logger.critical(f"[{trade.symbol}] EXIT FAILED — will retry next cycle.")
+        if trade.symbol not in self._exit_alert_sent:
+            self._send_raw_alert(
+                f"URGENT — EXIT FAILED\n"
+                f"Stock  : {trade.symbol}\n"
+                f"Reason : {reason}\n"
+                f"Side   : {trade.side} | Qty: {trade.qty}\n"
+                f"Engine will retry every 5s. Check DHAN APP if this repeats."
+            )
+            self._exit_alert_sent.add(trade.symbol)
+        return None
 
     # =========================================================
     # TICK SIZE HELPER
@@ -234,48 +207,38 @@ class ExecutionEngine:
         limit_price = self._round_to_tick(raw_limit, tick)
         self.logger.info(f"[{symbol}] Tick size: ₹{tick} | Limit price: ₹{limit_price}")
 
-        # ── Entry with retry ──────────────────────────────────
-        # Attempt 1: LIMIT order (0.3% buffer — within Dhan price band)
-        # Attempt 2: LIMIT order after brief wait
-        # If both fail → trade skipped, Telegram alert sent
+        # ── Single LIMIT entry attempt ────────────────────────
         entry_orderid      = None
         actual_entry_price = None
 
-        entry_attempts = [
-            ("LIMIT", limit_price),
-            ("LIMIT", limit_price),   # retry after short wait
-        ]
+        try:
+            self.logger.info(f"[{symbol}] Entry | LIMIT @ ₹{limit_price}")
+            entry_orderid = self._place_order(symbol, qty, limit_price, 0, "LIMIT", entry_txn)
 
-        for attempt_num, (order_type, price) in enumerate(entry_attempts, 1):
-            try:
-                self.logger.info(f"[{symbol}] Entry attempt {attempt_num}/2 | LIMIT @ ₹{price}")
-                entry_orderid = self._place_order(symbol, qty, price, 0, order_type, entry_txn)
+            if not entry_orderid:
+                raise ValueError("No order ID returned")
 
-                if not entry_orderid:
-                    raise ValueError("No order ID returned")
+            pytime.sleep(2)
+            order_status = self.tsl.get_order_status(orderid=entry_orderid)
+            if str(order_status).upper() in {"REJECTED", "CANCELLED", "FAILED", "INVALID"}:
+                raise ValueError(f"Order {order_status}")
 
-                pytime.sleep(1.5)
-                order_status = self.tsl.get_order_status(orderid=entry_orderid)
-                if str(order_status).upper() in {"REJECTED", "CANCELLED", "FAILED", "INVALID"}:
-                    raise ValueError(f"Order status: {order_status}")
+            actual_entry_price = self.tsl.get_executed_price(orderid=entry_orderid)
 
-                actual_entry_price = self.tsl.get_executed_price(orderid=entry_orderid)
-                if actual_entry_price:
-                    break  # success
+            if not actual_entry_price:
+                # Still pending after 2s — cancel to avoid untracked fill later
+                try:
+                    self.tsl.cancel_order(OrderID=entry_orderid)
+                    self.logger.warning(f"[{symbol}] Entry pending after 2s — cancelled.")
+                except Exception as ce:
+                    self.logger.error(f"[{symbol}] Cancel failed: {ce}")
+                raise ValueError("Order pending after 2s — cancelled and skipped")
 
-            except Exception as e:
-                self.logger.warning(f"[{symbol}] Entry attempt {attempt_num} failed: {e}")
-                entry_orderid = None
-                actual_entry_price = None
-
-                if attempt_num == 1:
-                    pytime.sleep(2)   # brief wait before retry
-
-        if not actual_entry_price:
-            self.logger.error(f"[{symbol}] Both LIMIT attempts failed. Trade skipped.")
+        except Exception as e:
+            self.logger.error(f"[{symbol}] Entry failed: {e}")
             self._send_raw_alert(
-                f"❌ ENTRY FAILED — {symbol}\n"
-                f"Both LIMIT attempts rejected at ₹{limit_price}\n"
+                f"ENTRY FAILED — {symbol}\n"
+                f"Reason : {e}\n"
                 f"Trade NOT placed."
             )
             return None
@@ -374,12 +337,14 @@ class ExecutionEngine:
         )
         if sl_hit:
             exit_price = self._live_market_exit(trade, ltp, "SL")
+            if exit_price is None:
+                return trade, False  # exit failed — keep in state, retry next cycle
             trade.pnl += (
                 (exit_price - trade.entry_price) * trade.qty
                 if trade.side == "BUY"
                 else (trade.entry_price - exit_price) * trade.qty
             )
-            self.logger.info(f"[{trade.symbol}] LIVE SL HIT at {exit_price}. Exit order sent.")
+            self.logger.info(f"[{trade.symbol}] LIVE SL HIT at {exit_price}.")
             self._send_alert("LIVE SL HIT", trade)
             return trade, True
 
@@ -390,12 +355,14 @@ class ExecutionEngine:
         )
         if tp1_hit:
             exit_price = self._live_market_exit(trade, ltp, "TP1")
+            if exit_price is None:
+                return trade, False  # exit failed — keep in state, retry next cycle
             trade.pnl += (
                 (exit_price - trade.entry_price) * trade.qty
                 if trade.side == "BUY"
                 else (trade.entry_price - exit_price) * trade.qty
             )
-            self.logger.info(f"[{trade.symbol}] LIVE TP1 HIT at {exit_price}. Exit order sent.")
+            self.logger.info(f"[{trade.symbol}] LIVE TP1 HIT at {exit_price}.")
             self._send_alert("LIVE TP1 FULL EXIT", trade)
             return trade, True
 
@@ -411,6 +378,7 @@ class ExecutionEngine:
             if cfg.PAPER_TRADE:
                 self.logger.info(f"[{trade.symbol}] PAPER FORCE SQUARE OFF")
                 self._send_alert("PAPER FORCE SQUARE OFF", trade)
+                self.state_manager.remove_trade(trade.symbol)
             else:
                 exit_txn = "SELL" if trade.side == "BUY" else "BUY"
                 try:
@@ -426,6 +394,13 @@ class ExecutionEngine:
                     )
                     self.logger.info(f"[{trade.symbol}] LIVE FORCE SQUARE OFF")
                     self._send_alert("LIVE FORCE SQUARE OFF", trade)
+                    self.state_manager.remove_trade(trade.symbol)
                 except Exception as e:
                     self.logger.error(f"[{trade.symbol}] Square off failed: {e}")
-            self.state_manager.remove_trade(trade.symbol)
+                    self._send_raw_alert(
+                        f"URGENT — FORCE EXIT FAILED\n"
+                        f"Stock  : {trade.symbol}\n"
+                        f"Side   : {trade.side} | Qty: {trade.qty}\n"
+                        f"Error  : {e}\n"
+                        f"Engine will retry. Check DHAN APP immediately."
+                    )

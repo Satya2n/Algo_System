@@ -52,7 +52,7 @@ def main():
     
     # 1. Connect
     tsl = connect_tradehull()
-    
+
     # 2. Modules
     state_manager = StateManager()
     risk_manager = RiskManager(cfg)
@@ -70,8 +70,9 @@ def main():
     except Exception as e:
         logger.error(f"Failed to send startup telegram alert: {e}")
 
-    last_slow_poll    = 0
-    last_reconnect_ts = 0   # track last reconnect to enforce 2-min cooldown
+    last_slow_poll      = 0
+    last_reconnect_ts   = 0
+    last_error_alert_ts = 0
 
     while True:
         try:
@@ -93,11 +94,12 @@ def main():
                 logger.info(f"Capital locked at ₹{cfg.CAPITAL:,.0f}")
 
             current_ts = time.time()
-            
+
             # ==========================================
             # FAST LOOP (5 seconds): Manage Open Trades
             # ==========================================
             active_trades = list(state_manager.state.active_trades.values())
+            all_ltp = {}
             if active_trades:
                 all_ltp = tsl.get_ltp_data(names=[t.symbol for t in active_trades])
                 if not all_ltp:
@@ -107,7 +109,6 @@ def main():
                     else:
                         logger.warning("LTP fetch failed — attempting reconnect...")
                         try:
-                            import os
                             token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
                             if os.path.exists(token_file):
                                 os.remove(token_file)
@@ -141,8 +142,14 @@ def main():
                 if state_manager.get_active_trade_count() >= cfg.MAX_CONCURRENT_TRADES:
                     continue
 
-                # Max Daily Loss Enforcement
-                unrealized_pnl = sum([t.pnl for t in active_trades])
+                # Max Daily Loss Enforcement — use real LTP not trade.pnl (which is 0 while open)
+                unrealized_pnl = 0.0
+                for t in active_trades:
+                    ltp = all_ltp.get(t.symbol, t.entry_price)
+                    if t.side == "BUY":
+                        unrealized_pnl += (ltp - t.entry_price) * t.qty
+                    else:
+                        unrealized_pnl += (t.entry_price - ltp) * t.qty
                 total_daily_pnl = state_manager.state.realized_daily_pnl + unrealized_pnl
                 max_loss_amount = -1.0 * (risk_manager.daily_starting_capital * cfg.MAX_DAILY_LOSS_PCT / 100.0)
                 if total_daily_pnl <= max_loss_amount:
@@ -158,7 +165,6 @@ def main():
                     else:
                         logger.warning("NIFTY data empty — attempting reconnect...")
                         try:
-                            import os
                             token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
                             if os.path.exists(token_file):
                                 os.remove(token_file)
@@ -246,6 +252,24 @@ def main():
             break
         except Exception as e:
             logger.exception(f"Main loop error: {e}")
+            now_ts = time.time()
+            if now_ts - last_error_alert_ts > 300:  # alert at most once every 5 minutes
+                try:
+                    import requests
+                    from urllib.parse import quote
+                    open_count = state_manager.get_active_trade_count()
+                    msg = (
+                        f"ENGINE ERROR\n"
+                        f"Error : {str(e)[:200]}\n"
+                        f"Open trades : {open_count}\n"
+                        f"Retrying in 10s."
+                    )
+                    url = (f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+                           f"/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={quote(msg)}")
+                    requests.get(url, timeout=10)
+                    last_error_alert_ts = now_ts
+                except Exception:
+                    pass
             time.sleep(10)
 
 if __name__ == "__main__":

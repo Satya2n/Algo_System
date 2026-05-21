@@ -140,6 +140,15 @@ class ExecutionEngine:
     def _round_to_step(self, price: float, step: int) -> int:
         return int(round(price / step) * step)
 
+    def _round_to_tick(self, price: float, tick_paise: int = 5) -> float:
+        """Round to nearest tick using integer arithmetic.
+        Avoids EXCH:16283 — float imprecision rejected by NSE.
+        NSE options default tick: 5 paise = Rs 0.05
+        """
+        price_paise = round(price * 100)
+        rounded = round(price_paise / tick_paise) * tick_paise
+        return rounded / 100
+
     def _safe_send(self, text: str) -> None:
         self.telegram.send(text)
 
@@ -785,7 +794,7 @@ class ExecutionEngine:
         # Hedge Leg (BUY)
         hedge_ltp = float(ltps.get(plan["hedge"]["symbol"], plan["hedge"]["ltp"]))
         hedge_buffer = max(hedge_ltp * self.cfg.limit_buffer_pct, self.cfg.min_absolute_buffer)
-        hedge_limit = round((hedge_ltp + hedge_buffer) * 20) / 20
+        hedge_limit = self._round_to_tick(hedge_ltp + hedge_buffer)
 
         hedge_order_id, hedge_fill = self._place_live_leg(
             tradingsymbol=plan["hedge"]["symbol"],
@@ -798,7 +807,7 @@ class ExecutionEngine:
             # Short Leg (SELL)
             short_ltp = float(ltps.get(plan["short"]["symbol"], plan["short"]["ltp"]))
             short_buffer = max(short_ltp * self.cfg.limit_buffer_pct, self.cfg.min_absolute_buffer)
-            short_limit = round(max(short_ltp - short_buffer, 0.05) * 20) / 20
+            short_limit = self._round_to_tick(max(short_ltp - short_buffer, 0.05))
 
             short_order_id, short_fill = self._place_live_leg(
                 tradingsymbol=plan["short"]["symbol"],
@@ -809,7 +818,7 @@ class ExecutionEngine:
         except Exception:
             try:
                 # Flatten the hedge leg if short leg fails
-                flatten_limit = round(max(hedge_fill - hedge_buffer, 0.05) * 20) / 20
+                flatten_limit = self._round_to_tick(max(hedge_fill - hedge_buffer, 0.05))
                 self.tsl.place_order(
                     tradingsymbol=plan["hedge"]["symbol"],
                     exchange="NFO",
@@ -904,7 +913,7 @@ class ExecutionEngine:
         # Short leg was SELL, so exit is BUY
         short_ltp = float(ltps.get(trade.short_leg_symbol, getattr(trade, "entry_price", 0)))
         short_buffer = max(short_ltp * self.cfg.limit_buffer_pct, self.cfg.min_absolute_buffer)
-        short_limit = round((short_ltp + short_buffer) * 20) / 20 if short_ltp > 0 else 0.0
+        short_limit = self._round_to_tick(short_ltp + short_buffer) if short_ltp > 0 else 0.0
 
         short_close_id, short_close_px = self._place_live_leg(
             tradingsymbol=trade.short_leg_symbol,
@@ -916,7 +925,7 @@ class ExecutionEngine:
         # Hedge leg was BUY, so exit is SELL
         hedge_ltp = float(ltps.get(trade.hedge_leg_symbol, getattr(trade, "entry_price", 0)))
         hedge_buffer = max(hedge_ltp * self.cfg.limit_buffer_pct, self.cfg.min_absolute_buffer)
-        hedge_limit = round(max(hedge_ltp - hedge_buffer, 0.05) * 20) / 20 if hedge_ltp > 0 else 0.0
+        hedge_limit = self._round_to_tick(max(hedge_ltp - hedge_buffer, 0.05)) if hedge_ltp > 0 else 0.0
 
         hedge_close_id, hedge_close_px = self._place_live_leg(
             tradingsymbol=trade.hedge_leg_symbol,
