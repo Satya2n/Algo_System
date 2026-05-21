@@ -230,7 +230,7 @@ class ExecutionEngine:
         # ── LIVE ──────────────────────────────────────────────
         entry_txn = "BUY" if side == "BUY" else "SELL"
         tick      = self._get_tick_size(symbol)
-        raw_limit = entry_price * 1.003 if side == "BUY" else entry_price * 0.997
+        raw_limit = entry_price * 1.01 if side == "BUY" else entry_price * 0.99
         limit_price = self._round_to_tick(raw_limit, tick)
         self.logger.info(f"[{symbol}] Tick size: ₹{tick} | Limit price: ₹{limit_price}")
 

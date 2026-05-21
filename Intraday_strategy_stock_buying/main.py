@@ -220,21 +220,11 @@ def main():
                         if signal == "ENTER_LONG":
                             sl = latest["low"] * 0.999
                             risk = entry - sl
-                            # L-6: minimum SL floor — 0.3% of entry to avoid noise hits
-                            min_risk = entry * 0.003
-                            if risk < min_risk:
-                                sl   = entry - min_risk
-                                risk = min_risk
                             tp1 = entry + (cfg.TP1_REWARD_RATIO * risk)
                             side = "BUY"
                         else:
                             sl = latest["high"] * 1.001
                             risk = sl - entry
-                            # L-6: minimum SL floor — 0.3% of entry to avoid noise hits
-                            min_risk = entry * 0.003
-                            if risk < min_risk:
-                                sl   = entry + min_risk
-                                risk = min_risk
                             tp1 = entry - (cfg.TP1_REWARD_RATIO * risk)
                             side = "SELL"
 
