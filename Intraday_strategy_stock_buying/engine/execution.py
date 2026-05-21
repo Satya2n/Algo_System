@@ -86,27 +86,9 @@ class ExecutionEngine:
             self.logger.warning(f"Telegram alert failed: {e}")
 
     def _reconnect(self):
-        """Attempt fresh TOTP login and refresh tsl connection."""
-        try:
-            from config.credentials import (
-                DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, DHAN_PIN, DHAN_TOTP_SECRET
-            )
-            import os
-            from datetime import date as _date
-            token_file = os.path.join("Dependencies", f"token_{_date.today()}.txt")
-            if os.path.exists(token_file):
-                os.remove(token_file)
-            from Dhan_Tradehull import Tradehull
-            if DHAN_ACCESS_TOKEN:
-                self.tsl = Tradehull(DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, mode="access_token")
-            else:
-                self.tsl = Tradehull(DHAN_CLIENT_CODE, mode="pin_totp",
-                                     pin=DHAN_PIN, totp_secret=DHAN_TOTP_SECRET)
-            self.logger.info("ExecutionEngine reconnected to Dhan.")
-            return True
-        except Exception as e:
-            self.logger.error(f"Reconnect failed: {e}")
-            return False
+        """No-op — reconnect is handled by main.py which also updates executor.tsl."""
+        self.logger.info("ExecutionEngine: reconnect deferred to main loop.")
+        return False
 
     def _place_order(self, symbol, qty, price, trigger_price, order_type, txn_type):
         """Single order placement call."""

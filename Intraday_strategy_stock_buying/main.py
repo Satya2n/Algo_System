@@ -152,6 +152,7 @@ def main():
                         if os.path.exists(token_file):
                             os.remove(token_file)
                         tsl = connect_tradehull()
+                        executor.tsl = tsl   # keep ExecutionEngine in sync
                         logger.info("Reconnected successfully.")
                     except Exception as re:
                         logger.error(f"Reconnect failed: {re}")
