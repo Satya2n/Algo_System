@@ -74,16 +74,16 @@ class ExecutionEngine:
             pass
 
     def _send_raw_alert(self, message: str):
-        """Send a plain text alert not tied to a trade object."""
+        """Send alert via direct HTTP — does not depend on Dhan session."""
         from config.credentials import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
         try:
-            self.tsl.send_telegram_alert(
-                message=message,
-                receiver_chat_id=TELEGRAM_CHAT_ID,
-                bot_token=TELEGRAM_BOT_TOKEN
-            )
-        except Exception:
-            pass
+            import requests
+            from urllib.parse import quote
+            url = (f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+                   f"/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={quote(message)}")
+            requests.get(url, timeout=10)
+        except Exception as e:
+            self.logger.warning(f"Telegram alert failed: {e}")
 
     def _reconnect(self):
         """Attempt fresh TOTP login and refresh tsl connection."""
