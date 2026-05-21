@@ -300,16 +300,17 @@ def score_volume(df: pd.DataFrame, stock_full: pd.DataFrame = None) -> int:
 
     If stock_full not provided: falls back to session-only average.
     """
-    if len(df) < 5:
+    current_vol = float(df["volume"].iloc[-1]) if not df.empty else 0.0
+    if current_vol <= 0:
         return 0
 
-    current_vol = float(df["volume"].iloc[-1])
-
     if stock_full is not None and len(stock_full) >= 21:
-        # Full 20-bar historical baseline — stable, includes yesterday
+        # Full 20-bar historical baseline — works at any time of day
         avg_vol = float(stock_full["volume"].iloc[-21:-1].mean())
     else:
-        # Fallback: session-only average
+        # Fallback: session-only average (needs at least 5 bars)
+        if len(df) < 5:
+            return 0
         lookback = min(20, len(df) - 1)
         if lookback < 3:
             return 0
