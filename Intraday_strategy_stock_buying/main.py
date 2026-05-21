@@ -243,23 +243,6 @@ def main():
                         qty, risk_amount = risk_manager.calculate_position_size(entry, sl)
 
                         if qty > 0:
-                            # L-7: Liquidity hard block if impact > 5%
-                            try:
-                                avg_bar_value = (live_df["close"] * live_df["volume"]).mean()
-                                position_value = qty * entry
-                                impact_pct = (position_value / avg_bar_value) * 100 if avg_bar_value > 0 else 0
-                                if impact_pct > 5.0:
-                                    logger.warning(
-                                        f"[{sym}] SKIPPED — liquidity impact {impact_pct:.1f}% > 5% "
-                                        f"(position ₹{position_value:,.0f} vs avg bar ₹{avg_bar_value:,.0f})"
-                                    )
-                                    continue
-                                elif impact_pct > 2.0:
-                                    logger.warning(
-                                        f"[{sym}] LOW LIQUIDITY WARNING: {impact_pct:.1f}% impact"
-                                    )
-                            except Exception:
-                                pass
 
                             executor.place_initial_orders(sym, side, qty, entry, sl, tp1)
                             # Break out to avoid firing 3 trades in one 5-minute bar
