@@ -916,6 +916,13 @@ Risk per trade → HARD CAP (qty calculation)
 | 21 May 2026 | Intraday | Volume score uses full 20-bar history | Session-only baseline inflated by opening rush → unreliable RVOL |
 | 21 May 2026 | Intraday | MAX_STOCKS 12 → 15 | More opportunity without quality compromise |
 | 21 May 2026 | Intraday | New watchlist from full-history backtest | 48% avg_R improvement: +0.366 → +0.543, win rate 46.6% → 51.9% |
+| 21 May 2026 | Intraday | EXCH:16283 fix — integer tick rounding | Float 5512.6000000003 rejected by NSE; integer arithmetic gives clean 5512.60 |
+| 21 May 2026 | Intraday | LIMIT buffer 1% → 0.3% | 1% buffer exceeded Dhan intraday price band; JKCEMENT/SKFINDIA/HINDALCO rejected |
+| 21 May 2026 | Intraday | Entry retry: 2 LIMIT attempts only | Was LIMIT+LIMIT+MARKET; retrying same broken LIMIT price is pointless |
+| 21 May 2026 | Intraday | Reconnect 2-min cooldown | Rapid retries hit Dhan "token once every 2 min" rate limit → cascade failure |
+| 21 May 2026 | Intraday | Score breakdown logged at every entry | Trades were unauditable — no way to verify score, RS, VWAP, trend at entry |
+| 21 May 2026 | Intraday | Min SL floor 0.3% of entry price | APLAPOLLO SL ₹4.75 (0.26%) hit in 50s — candle wick noise, not real move |
+| 21 May 2026 | Intraday | Removed liquidity impact hard block | Per-bar impact % was misleading (0.09% of daily volume = fine); volume score ≥4 is sufficient |
 
 ---
 
@@ -926,12 +933,14 @@ Risk per trade → HARD CAP (qty calculation)
 - Full 20-bar historical volume baseline is significantly more accurate than session-only
 - Raising threshold filters noise without sacrificing good signals
 - Fewer, higher-quality trades outperforms many mediocre ones
+- Integer arithmetic for tick rounding eliminates EXCH:16283 rejections
 
 ### What to Investigate Next
 - Gap-down regime filter (block SHORTs in first 45 min on recovery days)
 - Extension filter (skip if stock already moved >1% from open)
 - Per-stock direction bias (some stocks work LONG only, some SHORT only)
 - Score calculation based on real-time LTP vs closed bar (30-60s lag)
+- LIMIT buffer 0.3% — monitor if fills are getting worse before reducing further
 
 ---
 
