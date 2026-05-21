@@ -70,7 +70,8 @@ def main():
     except Exception as e:
         logger.error(f"Failed to send startup telegram alert: {e}")
 
-    last_slow_poll = 0
+    last_slow_poll    = 0
+    last_reconnect_ts = 0   # track last reconnect to enforce 2-min cooldown
 
     while True:
         try:
@@ -100,16 +101,22 @@ def main():
             if active_trades:
                 all_ltp = tsl.get_ltp_data(names=[t.symbol for t in active_trades])
                 if not all_ltp:
-                    logger.warning("LTP fetch failed — attempting reconnect...")
-                    try:
-                        import os
-                        token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
-                        if os.path.exists(token_file):
-                            os.remove(token_file)
-                        tsl = connect_tradehull()
-                        logger.info("Reconnected successfully.")
-                    except Exception as re:
-                        logger.error(f"Reconnect failed: {re}")
+                    now_ts = time.time()
+                    if now_ts - last_reconnect_ts < 120:
+                        logger.warning(f"LTP failed — reconnect cooldown ({int(120-(now_ts-last_reconnect_ts))}s left)")
+                    else:
+                        logger.warning("LTP fetch failed — attempting reconnect...")
+                        try:
+                            import os
+                            token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
+                            if os.path.exists(token_file):
+                                os.remove(token_file)
+                            tsl = connect_tradehull()
+                            executor.tsl = tsl
+                            last_reconnect_ts = time.time()
+                            logger.info("Reconnected successfully.")
+                        except Exception as re:
+                            logger.error(f"Reconnect failed: {re}")
                     time.sleep(cfg.FAST_POLL_INTERVAL_SECONDS)
                     continue
                 for trade in active_trades:
@@ -145,17 +152,22 @@ def main():
                 logger.info("Running slow poll for setups...")
                 nifty_full = tsl.get_historical_data(tradingsymbol="NIFTY", exchange="INDEX", timeframe="5")
                 if nifty_full is None or len(nifty_full) == 0:
-                    logger.warning("NIFTY data empty — token may be invalid. Attempting reconnect...")
-                    try:
-                        import os
-                        token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
-                        if os.path.exists(token_file):
-                            os.remove(token_file)
-                        tsl = connect_tradehull()
-                        executor.tsl = tsl   # keep ExecutionEngine in sync
-                        logger.info("Reconnected successfully.")
-                    except Exception as re:
-                        logger.error(f"Reconnect failed: {re}")
+                    now_ts = time.time()
+                    if now_ts - last_reconnect_ts < 120:
+                        logger.warning(f"NIFTY empty — reconnect cooldown ({int(120-(now_ts-last_reconnect_ts))}s left)")
+                    else:
+                        logger.warning("NIFTY data empty — attempting reconnect...")
+                        try:
+                            import os
+                            token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
+                            if os.path.exists(token_file):
+                                os.remove(token_file)
+                            tsl = connect_tradehull()
+                            executor.tsl = tsl
+                            last_reconnect_ts = time.time()
+                            logger.info("Reconnected successfully.")
+                        except Exception as re:
+                            logger.error(f"Reconnect failed: {re}")
                     continue
 
                 for sym in watchlist:
@@ -191,35 +203,60 @@ def main():
                         if ok: signal = "ENTER_SHORT"
 
                     if signal != "NO_TRADE":
+                        score = rank_result.get("long_score") if decision == "LONG" else rank_result.get("short_score")
+                        logger.info(
+                            f"[{sym}] SIGNAL {signal} | "
+                            f"Score:{score:.1f} | Vol:{rank_result.get('volume_score')}/10 | "
+                            f"RS:{rank_result.get('rs_long' if decision=='LONG' else 'rs_short'):.1f} | "
+                            f"VWAP:{rank_result.get('vwap_long' if decision=='LONG' else 'vwap_short'):.1f} | "
+                            f"Trend:{rank_result.get('trend_long' if decision=='LONG' else 'trend_short'):.1f} | "
+                            f"Gap:{rank_result.get('gap_pct',0):+.2f}%"
+                        )
+
+                    if signal != "NO_TRADE":
                         latest = live_df.iloc[-1]
                         entry = latest["close"]
                         
                         if signal == "ENTER_LONG":
                             sl = latest["low"] * 0.999
                             risk = entry - sl
+                            # L-6: minimum SL floor — 0.3% of entry to avoid noise hits
+                            min_risk = entry * 0.003
+                            if risk < min_risk:
+                                sl   = entry - min_risk
+                                risk = min_risk
                             tp1 = entry + (cfg.TP1_REWARD_RATIO * risk)
                             side = "BUY"
                         else:
                             sl = latest["high"] * 1.001
                             risk = sl - entry
+                            # L-6: minimum SL floor — 0.3% of entry to avoid noise hits
+                            min_risk = entry * 0.003
+                            if risk < min_risk:
+                                sl   = entry + min_risk
+                                risk = min_risk
                             tp1 = entry - (cfg.TP1_REWARD_RATIO * risk)
                             side = "SELL"
-                            
+
                         if risk <= 0: continue
 
                         qty, risk_amount = risk_manager.calculate_position_size(entry, sl)
 
                         if qty > 0:
-                            # Liquidity impact check — soft warning only, does not block trade
+                            # L-7: Liquidity hard block if impact > 5%
                             try:
                                 avg_bar_value = (live_df["close"] * live_df["volume"]).mean()
                                 position_value = qty * entry
                                 impact_pct = (position_value / avg_bar_value) * 100 if avg_bar_value > 0 else 0
-                                if impact_pct > 2.0:
+                                if impact_pct > 5.0:
                                     logger.warning(
-                                        f"[{sym}] LOW LIQUIDITY WARNING: position ₹{position_value:,.0f} "
-                                        f"= {impact_pct:.1f}% of avg bar value ₹{avg_bar_value:,.0f}. "
-                                        f"Slippage risk."
+                                        f"[{sym}] SKIPPED — liquidity impact {impact_pct:.1f}% > 5% "
+                                        f"(position ₹{position_value:,.0f} vs avg bar ₹{avg_bar_value:,.0f})"
+                                    )
+                                    continue
+                                elif impact_pct > 2.0:
+                                    logger.warning(
+                                        f"[{sym}] LOW LIQUIDITY WARNING: {impact_pct:.1f}% impact"
                                     )
                             except Exception:
                                 pass

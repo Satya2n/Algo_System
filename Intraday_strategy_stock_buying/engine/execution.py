@@ -179,8 +179,13 @@ class ExecutionEngine:
         return 0.05
 
     def _round_to_tick(self, price: float, tick: float) -> float:
-        """Round price to nearest valid tick size."""
-        return round(round(price / tick) * tick, 4)
+        """Round price to nearest tick using integer arithmetic.
+        Avoids EXCH:16283 — float 5512.6000000003 rejected by NSE.
+        """
+        tick_paise  = round(tick * 100)
+        price_paise = round(price * 100)
+        rounded     = round(price_paise / tick_paise) * tick_paise
+        return rounded / 100
 
     # =========================================================
     # ENTRY
@@ -225,26 +230,25 @@ class ExecutionEngine:
         # ── LIVE ──────────────────────────────────────────────
         entry_txn = "BUY" if side == "BUY" else "SELL"
         tick      = self._get_tick_size(symbol)
-        raw_limit = entry_price * 1.01 if side == "BUY" else entry_price * 0.99
+        raw_limit = entry_price * 1.003 if side == "BUY" else entry_price * 0.997
         limit_price = self._round_to_tick(raw_limit, tick)
         self.logger.info(f"[{symbol}] Tick size: ₹{tick} | Limit price: ₹{limit_price}")
 
         # ── Entry with retry ──────────────────────────────────
-        # Attempt 1: LIMIT order
-        # Attempt 2: LIMIT order after reconnect
-        # Attempt 3: MARKET order (guaranteed fill if market open)
-        entry_orderid    = None
+        # Attempt 1: LIMIT order (0.3% buffer — within Dhan price band)
+        # Attempt 2: LIMIT order after brief wait
+        # If both fail → trade skipped, Telegram alert sent
+        entry_orderid      = None
         actual_entry_price = None
 
         entry_attempts = [
-            ("LIMIT",  limit_price),
-            ("LIMIT",  limit_price),   # after reconnect
-            ("MARKET", 0),             # fallback to market
+            ("LIMIT", limit_price),
+            ("LIMIT", limit_price),   # retry after short wait
         ]
 
         for attempt_num, (order_type, price) in enumerate(entry_attempts, 1):
             try:
-                self.logger.info(f"[{symbol}] Entry attempt {attempt_num}/3 | {order_type} @ ₹{price or 'MKT'}")
+                self.logger.info(f"[{symbol}] Entry attempt {attempt_num}/2 | LIMIT @ ₹{price}")
                 entry_orderid = self._place_order(symbol, qty, price, 0, order_type, entry_txn)
 
                 if not entry_orderid:
@@ -265,17 +269,14 @@ class ExecutionEngine:
                 actual_entry_price = None
 
                 if attempt_num == 1:
-                    pytime.sleep(2)
-                    self._reconnect()
-                elif attempt_num == 2:
-                    pytime.sleep(2)
+                    pytime.sleep(2)   # brief wait before retry
 
         if not actual_entry_price:
-            self.logger.error(f"[{symbol}] All 3 entry attempts failed. Trade skipped.")
+            self.logger.error(f"[{symbol}] Both LIMIT attempts failed. Trade skipped.")
             self._send_raw_alert(
                 f"❌ ENTRY FAILED — {symbol}\n"
-                f"All 3 attempts failed (LIMIT×2 + MARKET)\n"
-                f"Trade NOT placed. Check Dhan app."
+                f"Both LIMIT attempts rejected at ₹{limit_price}\n"
+                f"Trade NOT placed."
             )
             return None
 
