@@ -195,28 +195,56 @@ def main():
                     if not rank_result: continue
                     decision = rank_result.get("decision", "SKIP")
 
+                    # Log scores for every stock — visible in log and Telegram watchlist
+                    ls  = rank_result.get("long_score", 0)
+                    ss  = rank_result.get("short_score", 0)
+                    vol = rank_result.get("volume_score", 0)
+                    rs_l  = rank_result.get("rs_long", 0)
+                    rs_s  = rank_result.get("rs_short", 0)
+                    vwap_l = rank_result.get("vwap_long", 0)
+                    vwap_s = rank_result.get("vwap_short", 0)
+                    tr_l  = rank_result.get("trend_long", 0)
+                    tr_s  = rank_result.get("trend_short", 0)
+                    gap   = rank_result.get("gap_pct", 0)
+                    logger.info(
+                        f"[{sym}] L:{ls:.0f} S:{ss:.0f} | Vol:{vol}/10 | "
+                        f"RS:{rs_l}/{rs_s} | VWAP:{vwap_l:.0f}/{vwap_s:.0f} | "
+                        f"Trend:{tr_l:.1f}/{tr_s:.1f} | Gap:{gap:+.2f}% | {decision}"
+                    )
+
                     # Volume filter — skip if < 4/10 (RVOL < 0.8x, no conviction)
-                    if rank_result.get("volume_score", 0) < 4:
-                        logger.info(f"[{sym}] Skipped — low volume ({rank_result['volume_score']}/10)")
+                    if vol < 4:
                         continue
-                    
+
                     signal = "NO_TRADE"
                     if decision == "LONG":
-                        ok, _ = confirm_long_pullback(live_df)
+                        ok, reason = confirm_long_pullback(live_df)
                         if ok: signal = "ENTER_LONG"
                     elif decision == "SHORT":
-                        ok, _ = confirm_short_pullback(live_df)
+                        ok, reason = confirm_short_pullback(live_df)
                         if ok: signal = "ENTER_SHORT"
+                    else:
+                        ok, reason = False, "Score below threshold"
 
                     if signal != "NO_TRADE":
-                        score = rank_result.get("long_score") if decision == "LONG" else rank_result.get("short_score")
+                        score = ls if decision == "LONG" else ss
                         logger.info(
                             f"[{sym}] SIGNAL {signal} | "
-                            f"Score:{score:.1f} | Vol:{rank_result.get('volume_score')}/10 | "
-                            f"RS:{rank_result.get('rs_long' if decision=='LONG' else 'rs_short'):.1f} | "
-                            f"VWAP:{rank_result.get('vwap_long' if decision=='LONG' else 'vwap_short'):.1f} | "
-                            f"Trend:{rank_result.get('trend_long' if decision=='LONG' else 'trend_short'):.1f} | "
-                            f"Gap:{rank_result.get('gap_pct',0):+.2f}%"
+                            f"Score:{score:.1f} | Vol:{vol}/10 | "
+                            f"RS:{rs_l if decision=='LONG' else rs_s:.1f} | "
+                            f"VWAP:{vwap_l if decision=='LONG' else vwap_s:.1f} | "
+                            f"Trend:{tr_l if decision=='LONG' else tr_s:.1f} | "
+                            f"Gap:{gap:+.2f}%"
+                        )
+                    elif decision != "SKIP":
+                        # Decision was LONG/SHORT but pullback not confirmed — alert for manual watch
+                        score = ls if decision == "LONG" else ss
+                        executor._send_raw_alert(
+                            f"WATCH — {sym}\n"
+                            f"Decision : {decision} | Score: {score:.0f}\n"
+                            f"Vol:{vol}/10 | RS:{rs_l if decision=='LONG' else rs_s} | "
+                            f"VWAP:{vwap_l if decision=='LONG' else vwap_s:.0f}\n"
+                            f"Pullback  : NOT confirmed ({reason})"
                         )
 
                     if signal != "NO_TRADE":
