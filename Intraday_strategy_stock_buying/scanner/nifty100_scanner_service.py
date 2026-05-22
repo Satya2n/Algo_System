@@ -39,6 +39,19 @@ SCAN_START     = datetime.time(9, 0)
 SCAN_END       = datetime.time(14, 30)
 
 
+def send_alert(message: str):
+    """Direct HTTP Telegram alert — session independent."""
+    from config.credentials import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    try:
+        import requests
+        from urllib.parse import quote
+        url = (f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+               f"/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={quote(message)}")
+        requests.get(url, timeout=10)
+    except Exception as e:
+        logger.warning(f"Telegram alert failed: {e}")
+
+
 def connect() -> Tradehull:
     if DHAN_ACCESS_TOKEN:
         logger.info("Connecting via access token.")
@@ -101,9 +114,10 @@ def run_scan(tsl: Tradehull, existing: dict) -> dict:
                     cur_dir   = updated[sym]["direction"]
                     cur_score = ls if cur_dir == "LONG" else ss
                     if cur_score < SCORE_REMOVE_THRESHOLD:
-                        logger.info(
-                            f"[{sym}] REMOVED — score dropped to {cur_score:.0f} "
-                            f"(threshold {SCORE_REMOVE_THRESHOLD})"
+                        logger.info(f"[{sym}] REMOVED — score dropped to {cur_score:.0f}")
+                        send_alert(
+                            f"WATCHLIST REMOVED — {sym}\n"
+                            f"Score dropped to {cur_score:.0f} (threshold {SCORE_REMOVE_THRESHOLD})"
                         )
                         del updated[sym]
                 continue
@@ -112,9 +126,17 @@ def run_scan(tsl: Tradehull, existing: dict) -> dict:
                 old_dir = updated[sym]["direction"]
                 if old_dir != direction:
                     logger.info(f"[{sym}] DIRECTION CHANGED {old_dir} → {direction} | L:{ls:.0f} S:{ss:.0f}")
+                    send_alert(
+                        f"WATCHLIST CHANGE — {sym}\n"
+                        f"Direction : {old_dir} -> {direction}\n"
+                        f"Score L:{ls:.0f} S:{ss:.0f} | Vol:{vol}/10"
+                    )
             else:
-                logger.info(
-                    f"[{sym}] ADDED — {direction} | Score:{score:.0f} | Vol:{vol}/10"
+                logger.info(f"[{sym}] ADDED — {direction} | Score:{score:.0f} | Vol:{vol}/10")
+                send_alert(
+                    f"WATCHLIST ADDED — {sym}\n"
+                    f"Direction : {direction}\n"
+                    f"Score:{score:.0f} | Vol:{vol}/10"
                 )
 
             updated[sym] = {
@@ -133,9 +155,20 @@ def run_scan(tsl: Tradehull, existing: dict) -> dict:
     n_long  = sum(1 for v in updated.values() if v["direction"] == "LONG")
     n_short = sum(1 for v in updated.values() if v["direction"] == "SHORT")
     logger.info(
-        f"Scan complete — {len(updated)} stocks in watchlist | "
-        f"LONG:{n_long} | SHORT:{n_short}"
+        f"Scan complete — {len(updated)} stocks | LONG:{n_long} | SHORT:{n_short}"
     )
+
+    # Send watchlist summary to Telegram after every scan
+    if updated:
+        longs  = [f"  {s}({v['score']:.0f})" for s, v in updated.items() if v["direction"] == "LONG"]
+        shorts = [f"  {s}({v['score']:.0f})" for s, v in updated.items() if v["direction"] == "SHORT"]
+        msg = f"WATCHLIST UPDATE — {datetime.datetime.now().strftime('%H:%M')}\n"
+        if longs:
+            msg += f"LONG ({n_long}):\n" + "\n".join(longs) + "\n"
+        if shorts:
+            msg += f"SHORT ({n_short}):\n" + "\n".join(shorts)
+        send_alert(msg)
+
     return updated
 
 
