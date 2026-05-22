@@ -136,20 +136,20 @@ class ExecutionEngine:
         """
         Fetch tick size from Dhan instrument file.
         SEM_TICK_SIZE is stored in PAISE — divide by 100 to get rupees.
-        Example: SEM_TICK_SIZE=5 → 5 paise → ₹0.05 (standard NSE equity tick)
+        Uses max tick across all rows for the symbol — Dhan NSE equity uses 10 paise.
         """
         try:
             inst = getattr(self.tsl, "instrument_df", None)
             if inst is not None and not inst.empty:
-                row = inst[inst["SEM_TRADING_SYMBOL"] == symbol]
-                if not row.empty:
-                    tick_paise = float(row.iloc[0].get("SEM_TICK_SIZE", 5.0))
-                    tick_rs = tick_paise / 100.0  # paise → rupees
+                rows = inst[inst["SEM_TRADING_SYMBOL"] == symbol]
+                if not rows.empty:
+                    tick_paise = float(rows["SEM_TICK_SIZE"].max())
+                    tick_rs = tick_paise / 100.0
                     if tick_rs > 0:
                         return tick_rs
         except Exception:
             pass
-        return 0.05
+        return 0.10
 
     def _round_to_tick(self, price: float, tick: float) -> float:
         """Round price to nearest tick using integer arithmetic.
