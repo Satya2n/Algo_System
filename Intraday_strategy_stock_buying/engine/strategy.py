@@ -654,15 +654,19 @@ def is_entry_time_allowed(df: pd.DataFrame) -> bool:
 
 def is_consolidating(
     stock_full: pd.DataFrame,
+    direction: str = "LONG",
     candles: int = 5,
     range_pct: float = 0.01,
     atr_squeeze: float = 0.8,
     vwap_pct: float = 0.007,
 ) -> tuple:
     """
-    Check 3 consolidation conditions using last N candles from full history.
-    Using full history means at 9:30 it uses yesterday's last 5 candles,
-    transitioning to today's candles naturally after 9:40.
+    Check 3 consolidation conditions on last N completed 5-min candles.
+    At 9:30 uses yesterday's last 5 candles — transitions to today naturally by 9:40.
+
+    VWAP check is directional:
+      LONG  → price must be ABOVE VWAP, within vwap_pct
+      SHORT → price must be BELOW VWAP, within vwap_pct
 
     Returns: (is_consolidating, box_high, box_low, reason)
     """
@@ -674,7 +678,7 @@ def is_consolidating(
         df["atr5"]  = talib.ATR(df["high"], df["low"], df["close"], timeperiod=5)
         df["atr20"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=20)
 
-        # Exclude the current forming candle — use only completed bars
+        # Completed candles only — exclude current forming bar
         recent   = df.iloc[-(candles + 1):-1]
         box_high = float(recent["high"].max())
         box_low  = float(recent["low"].min())
@@ -692,17 +696,23 @@ def is_consolidating(
         if atr5_val >= atr_squeeze * atr20_val:
             return False, box_high, box_low, f"ATR not contracting ({atr5_val:.2f} vs {atr20_val:.2f})"
 
-        # Condition 3 — near VWAP (today's session)
+        # Condition 3 — directional VWAP proximity (today's session)
         today_df = get_today_session(df)
         if today_df.empty:
             return False, box_high, box_low, "No today session"
         today_df = add_session_indicators(today_df)
-        latest   = today_df.iloc[-1]
-        vwap     = float(latest["vwap"])
-        close    = float(latest["close"])
-        vwap_dist = abs(close - vwap) / vwap
-        if vwap_dist > vwap_pct:
-            return False, box_high, box_low, f"VWAP dist {vwap_dist*100:.2f}% > {vwap_pct*100:.1f}%"
+        latest = today_df.iloc[-1]
+        vwap   = float(latest["vwap"])
+        close  = float(latest["close"])
+
+        if direction == "LONG":
+            vwap_diff = (close - vwap) / vwap   # positive = above VWAP
+            if not (0 <= vwap_diff <= vwap_pct):
+                return False, box_high, box_low, f"VWAP long invalid: {vwap_diff*100:.2f}% (need 0–{vwap_pct*100:.1f}%)"
+        elif direction == "SHORT":
+            vwap_diff = (vwap - close) / vwap   # positive = below VWAP
+            if not (0 <= vwap_diff <= vwap_pct):
+                return False, box_high, box_low, f"VWAP short invalid: {vwap_diff*100:.2f}% (need 0–{vwap_pct*100:.1f}%)"
 
         return True, box_high, box_low, "Consolidating"
 
@@ -717,23 +727,75 @@ def is_breakout(
     direction: str,
 ) -> tuple:
     """
-    Check if latest completed candle CLOSES beyond the consolidation box.
-    LONG  : close > box_high
-    SHORT : close < box_low
-
-    Returns: (broke_out, close_price)
+    Check if the last COMPLETED 5-min candle closed beyond the box.
+    Returns: (broke_out, close_price, candle_timestamp_str)
+    Timestamp is used by main.py to detect when the NEXT candle appears.
     """
     try:
-        df = standardize_df(stock_full)
+        df    = standardize_df(stock_full)
         today = get_today_session(df)
         if today.empty or len(today) < 2:
-            return False, 0.0
-        # Use last COMPLETED candle close — iloc[-2] skips the forming candle
+            return False, 0.0, ""
         close = float(today["close"].iloc[-2])
+        ts    = str(today.index[-2])
         if direction == "LONG"  and close > box_high:
-            return True, close
+            return True, close, ts
         if direction == "SHORT" and close < box_low:
-            return True, close
-        return False, close
+            return True, close, ts
+        return False, close, ts
     except Exception:
-        return False, 0.0
+        return False, 0.0, ""
+
+
+def is_pullback_entry_valid(
+    stock_full: pd.DataFrame,
+    box_high: float,
+    box_low: float,
+    direction: str,
+    breakout_ts: str,
+    vwap_pct: float = 0.008,
+) -> tuple:
+    """
+    STATE 3 check — after breakout, wait for the NEXT completed 5-min candle.
+    Detects when a new candle has appeared (ts differs from breakout_ts).
+
+    LONG  : new candle close still > box_high AND above VWAP within vwap_pct
+    SHORT : new candle close still < box_low  AND below VWAP within vwap_pct
+
+    Returns: (new_candle_appeared, is_valid, close_price, reason)
+    """
+    try:
+        df    = standardize_df(stock_full)
+        today = get_today_session(df)
+        if today.empty or len(today) < 2:
+            return False, False, 0.0, "Not enough data"
+
+        today   = add_session_indicators(today)
+        current_ts = str(today.index[-2])
+
+        if current_ts == breakout_ts:
+            return False, False, 0.0, "Waiting for pullback candle"
+
+        # New candle has appeared
+        latest = today.iloc[-2]
+        close  = float(latest["close"])
+        vwap   = float(latest["vwap"])
+
+        if direction == "LONG":
+            if close <= box_high:
+                return True, False, close, "Breakout failed — close back in box"
+            vwap_diff = (close - vwap) / vwap
+            if not (0 <= vwap_diff <= vwap_pct):
+                return True, False, close, f"VWAP extended for LONG: {vwap_diff*100:.2f}%"
+
+        elif direction == "SHORT":
+            if close >= box_low:
+                return True, False, close, "Breakdown failed — close back in box"
+            vwap_diff = (vwap - close) / vwap
+            if not (0 <= vwap_diff <= vwap_pct):
+                return True, False, close, f"VWAP extended for SHORT: {vwap_diff*100:.2f}%"
+
+        return True, True, close, "Valid pullback entry"
+
+    except Exception as e:
+        return False, False, 0.0, f"Error: {e}"

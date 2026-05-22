@@ -82,7 +82,7 @@ def save_watchlist(watchlist: dict):
 def run_scan(tsl: Tradehull, existing: dict) -> dict:
     logger.info(f"Starting NIFTY 100 scan ({len(NIFTY_100)} stocks)...")
 
-    nifty_full = tsl.get_historical_data("NIFTY", "INDEX", "5")
+    nifty_full = tsl.get_historical_data("NIFTY", "INDEX", "15")
     if nifty_full is None or len(nifty_full) == 0:
         logger.error("NIFTY data unavailable — skipping scan, keeping existing watchlist.")
         return existing
@@ -91,7 +91,7 @@ def run_scan(tsl: Tradehull, existing: dict) -> dict:
 
     for sym in NIFTY_100:
         try:
-            df = tsl.get_historical_data(sym, "NSE", "5")
+            df = tsl.get_historical_data(sym, "NSE", "15")
             if df is None or len(df) == 0:
                 continue
 
@@ -99,9 +99,13 @@ def run_scan(tsl: Tradehull, existing: dict) -> dict:
             if not r:
                 continue
 
-            ls = r["long_score"]
-            ss = r["short_score"]
+            ls  = r["long_score"]
+            ss  = r["short_score"]
             vol = r["volume_score"]
+
+            # Volume gate — skip low conviction stocks
+            if vol < 4:
+                continue
 
             # Determine best direction
             if ls >= SCORE_ADD_THRESHOLD and ls >= ss:

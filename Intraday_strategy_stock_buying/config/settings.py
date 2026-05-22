@@ -48,7 +48,8 @@ FORCE_EXIT  = time(15, 15)
 CONSOLIDATION_CANDLES   = 5      # last 5 bars (includes yesterday early morning)
 CONSOLIDATION_RANGE_PCT = 0.01   # box must be within 1%
 ATR_SQUEEZE_RATIO       = 0.8    # ATR5 < 0.8 × ATR20
-VWAP_PROXIMITY_PCT      = 0.007  # within 0.7% of VWAP
+VWAP_PROXIMITY_PCT      = 0.007  # within 0.7% of VWAP (consolidation check)
+VWAP_PULLBACK_PCT       = 0.008  # within 0.8% of VWAP (pullback entry check)
 LIMIT_BEYOND_BOX_PCT    = 0.005  # LIMIT entry 0.5% beyond box edge
 
 # =========================================================
