@@ -82,7 +82,7 @@ def save_watchlist(watchlist: dict):
 def run_scan(tsl: Tradehull, existing: dict) -> dict:
     logger.info(f"Starting NIFTY 100 scan ({len(NIFTY_100)} stocks)...")
 
-    nifty_full = tsl.get_historical_data("NIFTY", "INDEX", "15")
+    nifty_full = tsl.get_historical_data("NIFTY", "INDEX", "60")
     if nifty_full is None or len(nifty_full) == 0:
         logger.error("NIFTY data unavailable — skipping scan, keeping existing watchlist.")
         return existing
@@ -91,7 +91,7 @@ def run_scan(tsl: Tradehull, existing: dict) -> dict:
 
     for sym in NIFTY_100:
         try:
-            df = tsl.get_historical_data(sym, "NSE", "15")
+            df = tsl.get_historical_data(sym, "NSE", "60")
             if df is None or len(df) == 0:
                 continue
 
