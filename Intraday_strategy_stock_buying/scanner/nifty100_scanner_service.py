@@ -36,7 +36,7 @@ logger = logging.getLogger("SCANNER")
 
 WATCHLIST_FILE = "state/dynamic_watchlist.json"
 SCAN_START     = datetime.time(9, 0)
-SCAN_END       = datetime.time(14, 30)
+SCAN_END       = datetime.time(15, 10)
 
 
 def send_alert(message: str):
