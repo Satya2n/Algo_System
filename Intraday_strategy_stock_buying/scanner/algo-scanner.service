@@ -1,0 +1,16 @@
+[Unit]
+Description=NIFTY 100 Scanner Service
+After=network.target algo-intraday.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/algo/Algo_System/Intraday_strategy_stock_buying
+ExecStart=/home/ubuntu/algo/.venv/bin/python3 scanner/nifty100_scanner_service.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/ubuntu/algo/Algo_System/Intraday_strategy_stock_buying/logs/scanner.log
+StandardError=append:/home/ubuntu/algo/Algo_System/Intraday_strategy_stock_buying/logs/scanner.log
+
+[Install]
+WantedBy=multi-user.target

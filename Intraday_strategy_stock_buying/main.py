@@ -1,6 +1,7 @@
 # main.py
 import os
 import sys
+import json
 import time
 import logging
 import datetime
@@ -14,20 +15,22 @@ from Dhan_Tradehull import Tradehull
 from engine.state import StateManager
 from engine.risk import RiskManager
 from engine.execution import ExecutionEngine
-from engine.strategy import prepare_live_df, is_entry_time_allowed, rank_stock, confirm_long_pullback, confirm_short_pullback
+from engine.strategy import is_consolidating, is_breakout
 
 os.makedirs("logs", exist_ok=True)
 
-# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
         logging.FileHandler("logs/engine.log"),
-        logging.StreamHandler(sys.stdout)
-    ]
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 logger = logging.getLogger("MAIN")
+
+WATCHLIST_FILE = "state/dynamic_watchlist.json"
+
 
 def connect_tradehull() -> Tradehull:
     if DHAN_ACCESS_TOKEN:
@@ -37,38 +40,37 @@ def connect_tradehull() -> Tradehull:
         logger.info("Logging in via PIN + TOTP.")
         return Tradehull(DHAN_CLIENT_CODE, mode="pin_totp", pin=DHAN_PIN, totp_secret=DHAN_TOTP_SECRET)
     else:
-        raise ValueError("No valid credentials. Set DHAN_ACCESS_TOKEN or DHAN_PIN + DHAN_TOTP_SECRET in credentials.py")
+        raise ValueError("No valid credentials configured.")
 
 
-def get_watchlist():
+def get_dynamic_watchlist() -> dict:
+    """Read dynamic watchlist written by the scanner service."""
     try:
-        return pd.read_csv("data/preferred_watchlist.csv")["symbol"].dropna().tolist()
+        with open(WATCHLIST_FILE, "r") as f:
+            data = json.load(f)
+        return data.get("watchlist", {})
     except Exception:
-        logger.error("Could not read preferred_watchlist.csv")
-        return []
+        return {}
+
 
 def main():
-    logger.info("Initializing Intraday Pullback Engine...")
-    
-    # 1. Connect
-    tsl = connect_tradehull()
+    logger.info("Initializing Intraday Consolidation Breakout Engine...")
 
-    # 2. Modules
+    tsl           = connect_tradehull()
     state_manager = StateManager()
-    risk_manager = RiskManager(cfg)
-    executor = ExecutionEngine(tsl, state_manager)
-    watchlist = get_watchlist()
+    risk_manager  = RiskManager(cfg)
+    executor      = ExecutionEngine(tsl, state_manager)
 
-    logger.info(f"Loaded {len(watchlist)} symbols from watchlist.")
+    logger.info("Engine ready. Waiting for scanner to populate watchlist...")
 
     try:
         tsl.send_telegram_alert(
-            message=f"🚀 INTRADAY ENGINE STARTED\nMode: {'PAPER' if cfg.PAPER_TRADE else 'LIVE'}\nSymbols loaded: {len(watchlist)}",
+            message=f"INTRADAY ENGINE STARTED\nMode: {'PAPER' if cfg.PAPER_TRADE else 'LIVE'}\nStrategy: Consolidation Breakout",
             receiver_chat_id=TELEGRAM_CHAT_ID,
-            bot_token=TELEGRAM_BOT_TOKEN
+            bot_token=TELEGRAM_BOT_TOKEN,
         )
     except Exception as e:
-        logger.error(f"Failed to send startup telegram alert: {e}")
+        logger.error(f"Startup Telegram failed: {e}")
 
     last_slow_poll      = 0
     last_reconnect_ts   = 0
@@ -76,28 +78,28 @@ def main():
 
     while True:
         try:
-            now = datetime.datetime.now()
+            now          = datetime.datetime.now()
             current_time = now.time()
 
-            # Market Hours Check
+            # ── Market hours gate ──────────────────────────────
             if current_time < cfg.ENTRY_START or current_time >= cfg.FORCE_EXIT:
                 if current_time >= cfg.FORCE_EXIT and state_manager.get_active_trade_count() > 0:
-                    logger.warning("Force exit time reached. Squaring off all trades.")
+                    logger.warning("Force exit time. Squaring off all trades.")
                     executor.square_off_all()
                 logger.info("Outside market hours. Sleeping...")
                 time.sleep(60)
                 continue
 
-            # Lock Daily Capital (Prevents shrinking sizing bug)
+            # ── Lock daily capital ─────────────────────────────
             if risk_manager.daily_starting_capital == 0.0:
                 risk_manager.set_daily_capital(cfg.CAPITAL)
-                logger.info(f"Capital locked at ₹{cfg.CAPITAL:,.0f}")
+                logger.info(f"Capital locked at Rs{cfg.CAPITAL:,.0f}")
 
             current_ts = time.time()
 
-            # ==========================================
-            # FAST LOOP (5 seconds): Manage Open Trades
-            # ==========================================
+            # ══════════════════════════════════════════════════
+            # FAST LOOP (5s): Manage open trades — SL / TP1
+            # ══════════════════════════════════════════════════
             active_trades = list(state_manager.state.active_trades.values())
             all_ltp = {}
             if active_trades:
@@ -120,176 +122,136 @@ def main():
                             logger.error(f"Reconnect failed: {re}")
                     time.sleep(cfg.FAST_POLL_INTERVAL_SECONDS)
                     continue
+
                 for trade in active_trades:
                     ltp = all_ltp.get(trade.symbol)
-                    if not ltp: continue
-
-                    updated_trade, closed = executor.manage_open_trade(trade, ltp)
+                    if not ltp:
+                        continue
+                    _, closed = executor.manage_open_trade(trade, ltp)
                     if closed:
                         state_manager.remove_trade(trade.symbol)
 
                 time.sleep(cfg.FAST_POLL_INTERVAL_SECONDS)
 
-            # ==========================================
-            # SLOW LOOP (60 seconds): Find New Setups
-            # ==========================================
-            if current_ts - last_slow_poll >= cfg.POLL_INTERVAL_SECONDS:
-                last_slow_poll = current_ts
-                
-                # Check constraints
-                if state_manager.state.trade_count_today >= cfg.MAX_TRADES_PER_DAY:
+            # ══════════════════════════════════════════════════
+            # SLOW LOOP (60s): Consolidation + Breakout Check
+            # ══════════════════════════════════════════════════
+            if current_ts - last_slow_poll < cfg.POLL_INTERVAL_SECONDS:
+                if not active_trades:
+                    time.sleep(cfg.POLL_INTERVAL_SECONDS)
+                continue
+
+            last_slow_poll = current_ts
+
+            # ── Constraints ───────────────────────────────────
+            if state_manager.state.trade_count_today >= cfg.MAX_TRADES_PER_DAY:
+                continue
+            if state_manager.get_active_trade_count() >= cfg.MAX_CONCURRENT_TRADES:
+                continue
+
+            # ── Daily loss enforcement ────────────────────────
+            unrealized_pnl = 0.0
+            for t in active_trades:
+                ltp = all_ltp.get(t.symbol, t.entry_price)
+                unrealized_pnl += (ltp - t.entry_price) * t.qty if t.side == "BUY" \
+                    else (t.entry_price - ltp) * t.qty
+            total_daily_pnl = state_manager.state.realized_daily_pnl + unrealized_pnl
+            max_loss_amount = -1.0 * (risk_manager.daily_starting_capital * cfg.MAX_DAILY_LOSS_PCT / 100.0)
+            if total_daily_pnl <= max_loss_amount:
+                logger.warning(f"MAX DAILY LOSS HIT ({total_daily_pnl:.2f}). Halting entries.")
+                continue
+
+            # ── Entry window ──────────────────────────────────
+            if current_time >= cfg.ENTRY_END:
+                continue
+
+            # ── Read dynamic watchlist from scanner ───────────
+            watchlist = get_dynamic_watchlist()
+            if not watchlist:
+                logger.info("Dynamic watchlist empty — scanner not yet run or no qualifying stocks.")
+                continue
+
+            logger.info(f"Checking {len(watchlist)} stocks for consolidation breakout...")
+
+            # ── Consolidation + Breakout scan ─────────────────
+            for sym, info in watchlist.items():
+                direction = info["direction"]  # "LONG" or "SHORT"
+
+                if state_manager.get_trade(sym):
                     continue
-                if state_manager.get_active_trade_count() >= cfg.MAX_CONCURRENT_TRADES:
+                if state_manager.has_traded_today(sym):
                     continue
 
-                # Max Daily Loss Enforcement — use real LTP not trade.pnl (which is 0 while open)
-                unrealized_pnl = 0.0
-                for t in active_trades:
-                    ltp = all_ltp.get(t.symbol, t.entry_price)
-                    if t.side == "BUY":
-                        unrealized_pnl += (ltp - t.entry_price) * t.qty
-                    else:
-                        unrealized_pnl += (t.entry_price - ltp) * t.qty
-                total_daily_pnl = state_manager.state.realized_daily_pnl + unrealized_pnl
-                max_loss_amount = -1.0 * (risk_manager.daily_starting_capital * cfg.MAX_DAILY_LOSS_PCT / 100.0)
-                if total_daily_pnl <= max_loss_amount:
-                    logger.warning(f"MAX DAILY LOSS HIT ({total_daily_pnl:.2f} <= {max_loss_amount:.2f}). Halting new entries.")
+                stock_full = tsl.get_historical_data(tradingsymbol=sym, exchange="NSE", timeframe="5")
+                if stock_full is None or len(stock_full) == 0:
                     continue
 
-                logger.info("Running slow poll for setups...")
-                nifty_full = tsl.get_historical_data(tradingsymbol="NIFTY", exchange="INDEX", timeframe="5")
-                if nifty_full is None or len(nifty_full) == 0:
-                    now_ts = time.time()
-                    if now_ts - last_reconnect_ts < 120:
-                        logger.warning(f"NIFTY empty — reconnect cooldown ({int(120-(now_ts-last_reconnect_ts))}s left)")
-                    else:
-                        logger.warning("NIFTY data empty — attempting reconnect...")
-                        try:
-                            token_file = os.path.join("Dependencies", f"token_{datetime.date.today()}.txt")
-                            if os.path.exists(token_file):
-                                os.remove(token_file)
-                            tsl = connect_tradehull()
-                            executor.tsl = tsl
-                            last_reconnect_ts = time.time()
-                            logger.info("Reconnected successfully.")
-                        except Exception as re:
-                            logger.error(f"Reconnect failed: {re}")
+                # Check consolidation
+                consolidating, box_high, box_low, reason = is_consolidating(
+                    stock_full,
+                    candles=cfg.CONSOLIDATION_CANDLES,
+                    range_pct=cfg.CONSOLIDATION_RANGE_PCT,
+                    atr_squeeze=cfg.ATR_SQUEEZE_RATIO,
+                    vwap_pct=cfg.VWAP_PROXIMITY_PCT,
+                )
+
+                logger.info(
+                    f"[{sym}] {direction} | Box:{box_low:.2f}-{box_high:.2f} | "
+                    f"{'CONSOLIDATING' if consolidating else reason}"
+                )
+
+                if not consolidating:
                     continue
 
-                for sym in watchlist:
-                    if state_manager.get_trade(sym):
-                        continue  # already in active trade
-                    if state_manager.has_traded_today(sym):
-                        continue  # already traded this symbol today — no re-entry
+                # Check breakout
+                broke_out, close_price = is_breakout(stock_full, box_high, box_low, direction)
+                if not broke_out:
+                    logger.info(f"[{sym}] Consolidating but no breakout yet (close:{close_price:.2f})")
+                    continue
 
-                    stock_full = tsl.get_historical_data(tradingsymbol=sym, exchange="NSE", timeframe="5")
-                    if stock_full is None or len(stock_full) == 0:
-                        continue
+                logger.info(f"[{sym}] BREAKOUT {direction} | Close:{close_price:.2f} | Box:{box_low:.2f}-{box_high:.2f}")
 
-                    live_df = prepare_live_df(stock_full)
-                    if not is_entry_time_allowed(live_df):
-                        continue
+                # ── Calculate entry, SL, TP1 from box levels ──
+                tick = executor._get_tick_size(sym, close_price)
 
-                    # Evaluate Logic
-                    rank_result = rank_stock(stock_full, nifty_full)
-                    if not rank_result: continue
-                    decision = rank_result.get("decision", "SKIP")
+                if direction == "LONG":
+                    entry = executor._round_to_tick(close_price * (1 + cfg.LIMIT_BEYOND_BOX_PCT), tick)
+                    sl    = executor._round_to_tick(box_low * 0.999, tick)
+                    side  = "BUY"
+                else:
+                    entry = executor._round_to_tick(close_price * (1 - cfg.LIMIT_BEYOND_BOX_PCT), tick)
+                    sl    = executor._round_to_tick(box_high * 1.001, tick)
+                    side  = "SELL"
 
-                    # Log scores for every stock — visible in log and Telegram watchlist
-                    ls  = rank_result.get("long_score", 0)
-                    ss  = rank_result.get("short_score", 0)
-                    vol = rank_result.get("volume_score", 0)
-                    rs_l  = rank_result.get("rs_long", 0)
-                    rs_s  = rank_result.get("rs_short", 0)
-                    vwap_l = rank_result.get("vwap_long", 0)
-                    vwap_s = rank_result.get("vwap_short", 0)
-                    tr_l  = rank_result.get("trend_long", 0)
-                    tr_s  = rank_result.get("trend_short", 0)
-                    gap   = rank_result.get("gap_pct", 0)
-                    logger.info(
-                        f"[{sym}] L:{ls:.0f} S:{ss:.0f} | Vol:{vol}/10 | "
-                        f"RS:{rs_l}/{rs_s} | VWAP:{vwap_l:.0f}/{vwap_s:.0f} | "
-                        f"Trend:{tr_l:.1f}/{tr_s:.1f} | Gap:{gap:+.2f}% | {decision}"
-                    )
+                risk = abs(entry - sl)
+                if risk <= 0:
+                    continue
 
-                    # Volume filter — skip if < 4/10 (RVOL < 0.8x, no conviction)
-                    if vol < 4:
-                        continue
+                tp1 = entry + (cfg.TP1_REWARD_RATIO * risk) if direction == "LONG" \
+                    else entry - (cfg.TP1_REWARD_RATIO * risk)
 
-                    signal = "NO_TRADE"
-                    if decision == "LONG":
-                        ok, reason = confirm_long_pullback(live_df)
-                        if ok: signal = "ENTER_LONG"
-                    elif decision == "SHORT":
-                        ok, reason = confirm_short_pullback(live_df)
-                        if ok: signal = "ENTER_SHORT"
-                    else:
-                        ok, reason = False, "Score below threshold"
+                qty, _ = risk_manager.calculate_position_size(entry, sl)
+                if qty <= 0:
+                    continue
 
-                    if signal != "NO_TRADE":
-                        score = ls if decision == "LONG" else ss
-                        logger.info(
-                            f"[{sym}] SIGNAL {signal} | "
-                            f"Score:{score:.1f} | Vol:{vol}/10 | "
-                            f"RS:{rs_l if decision=='LONG' else rs_s:.1f} | "
-                            f"VWAP:{vwap_l if decision=='LONG' else vwap_s:.1f} | "
-                            f"Trend:{tr_l if decision=='LONG' else tr_s:.1f} | "
-                            f"Gap:{gap:+.2f}%"
-                        )
-                    elif decision != "SKIP":
-                        # Decision was LONG/SHORT but pullback not confirmed — alert for manual watch
-                        score = ls if decision == "LONG" else ss
-                        executor._send_raw_alert(
-                            f"WATCH — {sym}\n"
-                            f"Decision : {decision} | Score: {score:.0f}\n"
-                            f"Vol:{vol}/10 | RS:{rs_l if decision=='LONG' else rs_s} | "
-                            f"VWAP:{vwap_l if decision=='LONG' else vwap_s:.0f}\n"
-                            f"Pullback  : NOT confirmed ({reason})"
-                        )
-
-                    if signal != "NO_TRADE":
-                        latest = live_df.iloc[-1]
-                        entry = latest["close"]
-                        
-                        if signal == "ENTER_LONG":
-                            sl = latest["low"] * 0.999
-                            risk = entry - sl
-                            tp1 = entry + (cfg.TP1_REWARD_RATIO * risk)
-                            side = "BUY"
-                        else:
-                            sl = latest["high"] * 1.001
-                            risk = sl - entry
-                            tp1 = entry - (cfg.TP1_REWARD_RATIO * risk)
-                            side = "SELL"
-
-                        if risk <= 0: continue
-
-                        qty, risk_amount = risk_manager.calculate_position_size(entry, sl)
-
-                        if qty > 0:
-
-                            executor.place_initial_orders(sym, side, qty, entry, sl, tp1)
-                            # Break out to avoid firing 3 trades in one 5-minute bar
-                            break
-
-            if not active_trades:
-                time.sleep(cfg.POLL_INTERVAL_SECONDS)
+                trade_placed = executor.place_initial_orders(sym, side, qty, entry, sl, tp1)
+                if trade_placed:
+                    break  # one entry per slow poll cycle
 
         except KeyboardInterrupt:
-            logger.info("Engine gracefully stopped by user.")
+            logger.info("Engine stopped by user.")
             break
         except Exception as e:
             logger.exception(f"Main loop error: {e}")
             now_ts = time.time()
-            if now_ts - last_error_alert_ts > 300:  # alert at most once every 5 minutes
+            if now_ts - last_error_alert_ts > 300:
                 try:
                     import requests
                     from urllib.parse import quote
-                    open_count = state_manager.get_active_trade_count()
                     msg = (
                         f"ENGINE ERROR\n"
                         f"Error : {str(e)[:200]}\n"
-                        f"Open trades : {open_count}\n"
+                        f"Open trades : {state_manager.get_active_trade_count()}\n"
                         f"Retrying in 10s."
                     )
                     url = (f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
@@ -299,6 +261,7 @@ def main():
                 except Exception:
                     pass
             time.sleep(10)
+
 
 if __name__ == "__main__":
     main()

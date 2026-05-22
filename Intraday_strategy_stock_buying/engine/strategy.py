@@ -646,3 +646,92 @@ def is_entry_time_allowed(df: pd.DataFrame) -> bool:
     hard_stop = time(12, 0)
 
     return morning_start <= latest_time < hard_stop
+
+
+# =========================
+# Consolidation breakout
+# =========================
+
+def is_consolidating(
+    stock_full: pd.DataFrame,
+    candles: int = 5,
+    range_pct: float = 0.01,
+    atr_squeeze: float = 0.8,
+    vwap_pct: float = 0.007,
+) -> tuple:
+    """
+    Check 3 consolidation conditions using last N candles from full history.
+    Using full history means at 9:30 it uses yesterday's last 5 candles,
+    transitioning to today's candles naturally after 9:40.
+
+    Returns: (is_consolidating, box_high, box_low, reason)
+    """
+    try:
+        df = standardize_df(stock_full).copy()
+        if len(df) < max(candles, 21):
+            return False, 0.0, 0.0, "Not enough data"
+
+        df["atr5"]  = talib.ATR(df["high"], df["low"], df["close"], timeperiod=5)
+        df["atr20"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=20)
+
+        recent   = df.tail(candles)
+        box_high = float(recent["high"].max())
+        box_low  = float(recent["low"].min())
+
+        # Condition 1 — tight range
+        range_ratio = (box_high - box_low) / box_low
+        if range_ratio > range_pct:
+            return False, box_high, box_low, f"Range {range_ratio*100:.2f}% > {range_pct*100:.0f}%"
+
+        # Condition 2 — ATR squeeze
+        atr5_val  = float(df["atr5"].iloc[-1])
+        atr20_val = float(df["atr20"].iloc[-1])
+        if pd.isna(atr5_val) or pd.isna(atr20_val) or atr20_val == 0:
+            return False, box_high, box_low, "ATR unavailable"
+        if atr5_val >= atr_squeeze * atr20_val:
+            return False, box_high, box_low, f"ATR not contracting ({atr5_val:.2f} vs {atr20_val:.2f})"
+
+        # Condition 3 — near VWAP (today's session)
+        today_df = get_today_session(df)
+        if today_df.empty:
+            return False, box_high, box_low, "No today session"
+        today_df = add_session_indicators(today_df)
+        latest   = today_df.iloc[-1]
+        vwap     = float(latest["vwap"])
+        close    = float(latest["close"])
+        vwap_dist = abs(close - vwap) / vwap
+        if vwap_dist > vwap_pct:
+            return False, box_high, box_low, f"VWAP dist {vwap_dist*100:.2f}% > {vwap_pct*100:.1f}%"
+
+        return True, box_high, box_low, "Consolidating"
+
+    except Exception as e:
+        return False, 0.0, 0.0, f"Error: {e}"
+
+
+def is_breakout(
+    stock_full: pd.DataFrame,
+    box_high: float,
+    box_low: float,
+    direction: str,
+) -> tuple:
+    """
+    Check if latest completed candle CLOSES beyond the consolidation box.
+    LONG  : close > box_high
+    SHORT : close < box_low
+
+    Returns: (broke_out, close_price)
+    """
+    try:
+        df = standardize_df(stock_full)
+        today = get_today_session(df)
+        if today.empty:
+            return False, 0.0
+        close = float(today["close"].iloc[-1])
+        if direction == "LONG"  and close > box_high:
+            return True, close
+        if direction == "SHORT" and close < box_low:
+            return True, close
+        return False, close
+    except Exception:
+        return False, 0.0

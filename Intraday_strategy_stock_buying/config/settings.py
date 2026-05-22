@@ -39,4 +39,21 @@ POLL_INTERVAL_SECONDS = 60       # Slow loop (scans for new entries)
 FAST_POLL_INTERVAL_SECONDS = 5   # Fast loop (manages active trades)
 
 ENTRY_START = time(9, 30)
-FORCE_EXIT = time(15, 15)
+ENTRY_END   = time(14, 30)   # consolidation breakout entry cutoff
+FORCE_EXIT  = time(15, 15)
+
+# =========================================================
+# CONSOLIDATION BREAKOUT PARAMETERS
+# =========================================================
+CONSOLIDATION_CANDLES   = 5      # last 5 bars (includes yesterday early morning)
+CONSOLIDATION_RANGE_PCT = 0.01   # box must be within 1%
+ATR_SQUEEZE_RATIO       = 0.8    # ATR5 < 0.8 × ATR20
+VWAP_PROXIMITY_PCT      = 0.007  # within 0.7% of VWAP
+LIMIT_BEYOND_BOX_PCT    = 0.005  # LIMIT entry 0.5% beyond box edge
+
+# =========================================================
+# NIFTY 100 SCANNER PARAMETERS
+# =========================================================
+NIFTY100_SCAN_INTERVAL   = 900   # seconds — scan every 15 minutes
+SCORE_ADD_THRESHOLD      = 70    # add to watchlist when score > 70
+SCORE_REMOVE_THRESHOLD   = 50    # remove from watchlist when score < 50
