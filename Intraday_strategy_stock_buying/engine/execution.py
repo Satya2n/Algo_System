@@ -100,7 +100,7 @@ class ExecutionEngine:
         """
         exit_txn = "SELL" if trade.side == "BUY" else "BUY"
         try:
-            self.logger.info(f"[{trade.symbol}] Exit | MARKET | reason={reason}")
+            self.logger.info(f"[{trade.symbol}] Exit | MARKET | reason={reason} | ltp={ltp}")
             order_id = self._place_order(trade.symbol, trade.qty, 0, 0, "MARKET", exit_txn)
             if order_id:
                 pytime.sleep(1)
@@ -132,11 +132,13 @@ class ExecutionEngine:
     # TICK SIZE HELPER
     # =========================================================
 
-    def _get_tick_size(self, symbol: str) -> float:
+    def _get_tick_size(self, symbol: str, price: float = 0.0) -> float:
         """
-        Fetch tick size from Dhan instrument file.
-        SEM_TICK_SIZE is stored in PAISE — divide by 100 to get rupees.
-        Uses max tick across all rows for the symbol — Dhan NSE equity uses 10 paise.
+        NSE tiered tick sizes:
+          < ₹250   → ₹0.01 |  ₹250–₹1000  → ₹0.05
+          ₹1000–₹5000 → ₹0.10 | ₹5000–₹10000 → ₹0.50
+          ₹10000–₹20000 → ₹1.00 | > ₹20000 → ₹5.00
+        Uses instrument file first (max across rows), falls back to price-based tier.
         """
         try:
             inst = getattr(self.tsl, "instrument_df", None)
@@ -149,6 +151,13 @@ class ExecutionEngine:
                         return tick_rs
         except Exception:
             pass
+        if price > 0:
+            if price < 250:   return 0.01
+            if price < 1000:  return 0.05
+            if price < 5000:  return 0.10
+            if price < 10000: return 0.50
+            if price < 20000: return 1.00
+            return 5.00
         return 0.10
 
     def _round_to_tick(self, price: float, tick: float) -> float:
@@ -202,7 +211,7 @@ class ExecutionEngine:
 
         # ── LIVE ──────────────────────────────────────────────
         entry_txn = "BUY" if side == "BUY" else "SELL"
-        tick      = self._get_tick_size(symbol)
+        tick      = self._get_tick_size(symbol, entry_price)
         raw_limit = entry_price * 1.005 if side == "BUY" else entry_price * 0.995
         limit_price = self._round_to_tick(raw_limit, tick)
         self.logger.info(f"[{symbol}] Tick size: ₹{tick} | Limit price: ₹{limit_price}")
