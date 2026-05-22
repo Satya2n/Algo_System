@@ -225,11 +225,20 @@ def main():
                         f"{'CONSOLIDATING ✓' if consolidating else reason}"
                     )
                     if consolidating:
+                        # Record which candle was last completed at confirmation time
+                        # STATE 2 will only check breakout on a NEWER candle than this
+                        try:
+                            _df = standardize_df(stock_full)
+                            _today = get_today_session(_df)
+                            confirmed_ts = str(_today.index[-2]) if len(_today) >= 2 else ""
+                        except Exception:
+                            confirmed_ts = ""
                         consolidation_map[sym] = {
                             "state":             "CONSOLIDATING",
                             "direction":          direction,
                             "box_high":           box_high,
                             "box_low":            box_low,
+                            "confirmed_at_ts":    confirmed_ts,
                             "breakout_candle_ts": None,
                         }
 
@@ -237,10 +246,16 @@ def main():
                 # STATE 2 — CONSOLIDATING (waiting for breakout)
                 # ─────────────────────────────────────────────
                 elif current_state == "CONSOLIDATING":
-                    box_high = consolidation_map[sym]["box_high"]
-                    box_low  = consolidation_map[sym]["box_low"]
+                    box_high      = consolidation_map[sym]["box_high"]
+                    box_low       = consolidation_map[sym]["box_low"]
+                    confirmed_ts  = consolidation_map[sym].get("confirmed_at_ts", "")
 
                     broke_out, close, ts = is_breakout(stock_full, box_high, box_low, direction)
+
+                    # Require a NEW candle after STATE 1 confirmation before accepting breakout
+                    if ts == confirmed_ts:
+                        logger.info(f"[{sym}] Consolidating — waiting for new candle after confirmation")
+                        continue
 
                     if broke_out:
                         logger.info(
