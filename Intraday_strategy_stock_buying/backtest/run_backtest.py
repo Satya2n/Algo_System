@@ -1,70 +1,58 @@
 """
-Weekly Watchlist Generator
-===========================
-Run this every week before the market opens to refresh your stock watchlist.
+Consolidation Breakout Backtest
+================================
+Tests the 3-state consolidation breakout strategy on NIFTY 50 stocks.
 
-What it does:
-  1. Fetches last 3 months of 5-min data for every NIFTY 200 stock
-  2. Runs the same pullback + RS-scoring strategy used in live trading
-  3. Filters stocks that have a proven edge (profit factor, avg R, win rate)
-  4. Saves the shortlist to data/preferred_watchlist.csv
+Strategy:
+  STATE 1 — Consolidation confirmed:
+    Last 5 completed 5-min candles in tight range (≤1%)
+    ATR5 < 0.8 × ATR20 (squeeze)
+    Price directionally within 0.7% of VWAP
+
+  STATE 2 — Breakout:
+    Next completed candle closes beyond the box
+    (time gap: must be a NEW candle after STATE 1 confirmation)
+
+  STATE 3 — Pullback entry:
+    Candle after breakout: still beyond box + directional VWAP ≤0.8%
+    Entry LIMIT at box edge + 0.5%
+
+  Trade management:
+    SL = box opposite edge
+    TP1 = 1.75× risk (full exit)
+    Force exit at 15:15 if neither hit
 
 Usage:
     cd Intraday_strategy_stock_buying
     python3 backtest/run_backtest.py
 
 Output:
-    data/preferred_watchlist.csv   — feed directly into the live engine
-    backtest/results/report.csv    — full per-stock metrics
+    backtest/results/report_YYYYMMDD.csv
 """
 
 import sys
-import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, time as dtime
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
+import talib
 
-# ── path setup ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config.credentials import (
     DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, DHAN_PIN, DHAN_TOTP_SECRET,
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
 )
-from engine.strategy import (
-    standardize_df, add_full_indicators, get_today_session,
-    add_session_indicators, rank_stock, prepare_live_df,
-    confirm_long_pullback, confirm_short_pullback,
-)
-from backtest.universe import NIFTY_200
+from engine.strategy import standardize_df
 from Dhan_Tradehull import Tradehull
 
-
-# ── Telegram helper ───────────────────────────────────────────────────────────
-
-def send_telegram(message: str) -> None:
-    try:
-        import requests
-        from urllib.parse import quote
-        url = (
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-            f"/sendMessage?chat_id={TELEGRAM_CHAT_ID}&text={quote(message)}"
-        )
-        requests.get(url, timeout=15)
-    except Exception as e:
-        logger.warning(f"Telegram send failed: {e}")
-
-# ── output dirs ───────────────────────────────────────────────────────────────
-RESULTS_DIR  = ROOT / "backtest" / "results"
-WATCHLIST_OUT = ROOT / "data" / "preferred_watchlist.csv"
+# ── output ────────────────────────────────────────────────────────────────────
+RESULTS_DIR = ROOT / "backtest" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -75,42 +63,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BACKTEST")
 
-# ── filter thresholds (adjust to tighten/loosen the shortlist) ────────────────
-MIN_TRADES        = 8      # ignore stocks with fewer signals (too thin)
-MIN_PROFIT_FACTOR = 1.2    # at least 20% more wins than losses by value
-MIN_AVG_R         = 0.05   # average R-multiple must be positive & meaningful
-MAX_STOCKS        = 15     # top 15 stocks
+# ── NIFTY 50 universe ─────────────────────────────────────────────────────────
+NIFTY_50 = [
+    "RELIANCE",  "TCS",       "HDFCBANK",  "BHARTIARTL", "ICICIBANK",
+    "INFY",      "SBIN",      "HINDUNILVR","ITC",        "LT",
+    "KOTAKBANK", "AXISBANK",  "BAJFINANCE","MARUTI",     "HCLTECH",
+    "SUNPHARMA", "TITAN",     "WIPRO",     "ULTRACEMCO", "ASIANPAINT",
+    "BAJAJFINSV","NTPC",      "POWERGRID", "TATAMOTORS", "ADANIPORTS",
+    "ONGC",      "COALINDIA", "TATASTEEL", "JSWSTEEL",   "INDUSINDBK",
+    "GRASIM",    "DRREDDY",   "TECHM",     "CIPLA",      "DIVISLAB",
+    "ADANIENT",  "BRITANNIA", "HINDALCO",  "BAJAJ-AUTO", "HEROMOTOCO",
+    "EICHERMOT", "TATACONSUM","NESTLEIND", "BPCL",       "IOC",
+    "APOLLOHOSP","HDFCLIFE",  "SBILIFE",   "M&M",        "LTIM",
+]
 
-# ── simulation settings ───────────────────────────────────────────────────────
-TP1_RR           = 1.75   # matches live engine TP1_REWARD_RATIO
-ENTRY_START_H    = (9, 30)
-ENTRY_END_H      = (12, 0) # no new entries after noon
-FORCE_EXIT_H     = (15, 15)
-BROKERAGE        = 40.0   # ₹ per trade (round-trip, both legs)
-SLEEP_BETWEEN    = 1.2    # seconds between API calls (avoid rate limits)
+# ── strategy parameters ───────────────────────────────────────────────────────
+CONSOLIDATION_CANDLES   = 5
+CONSOLIDATION_RANGE_PCT = 0.01     # ≤ 1%
+ATR_SQUEEZE_RATIO       = 0.8      # ATR5 < 0.8 × ATR20
+VWAP_PROXIMITY_PCT      = 0.007    # ≤ 0.7% at consolidation
+VWAP_PULLBACK_PCT       = 0.008    # ≤ 0.8% at pullback entry
+ENTRY_LIMIT_PCT         = 0.005    # 0.5% beyond box edge
+TP1_RR                  = 1.75     # reward:risk ratio
+
+ENTRY_START  = dtime(9, 30)
+ENTRY_END    = dtime(14, 30)
+FORCE_EXIT   = dtime(15, 15)
+SLEEP_BETWEEN = 1.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# BROKER CONNECTION
-# ══════════════════════════════════════════════════════════════════════════════
+# ── broker ────────────────────────────────────────────────────────────────────
 
 def connect() -> Tradehull:
     if DHAN_ACCESS_TOKEN:
         logger.info("Login: access token")
         return Tradehull(DHAN_CLIENT_CODE, DHAN_ACCESS_TOKEN, mode="access_token")
-    if DHAN_PIN and DHAN_TOTP_SECRET:
-        logger.info("Login: PIN + TOTP")
-        return Tradehull(DHAN_CLIENT_CODE, mode="pin_totp",
-                         pin=DHAN_PIN, totp_secret=DHAN_TOTP_SECRET)
-    raise ValueError("No credentials. Set DHAN_ACCESS_TOKEN or DHAN_PIN + DHAN_TOTP_SECRET.")
+    logger.info("Login: PIN + TOTP")
+    return Tradehull(DHAN_CLIENT_CODE, mode="pin_totp",
+                     pin=DHAN_PIN, totp_secret=DHAN_TOTP_SECRET)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TIME HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _to_naive(ts):
-    """Strip timezone from a Timestamp."""
     if hasattr(ts, "tz_convert") and ts.tz is not None:
         ts = ts.tz_convert("Asia/Kolkata")
     if hasattr(ts, "tz_localize"):
@@ -118,426 +113,375 @@ def _to_naive(ts):
     return ts
 
 
-def is_entry_bar(ts) -> bool:
-    """True if the bar falls in the allowed entry window 09:30–12:00."""
-    ts = _to_naive(ts)
-    t  = ts.time()
-    from datetime import time as dtime
-    return dtime(*ENTRY_START_H) <= t < dtime(*ENTRY_END_H)
+def in_entry_window(ts) -> bool:
+    t = _to_naive(ts).time()
+    return ENTRY_START <= t < ENTRY_END
 
 
-def is_force_exit_bar(ts) -> bool:
-    """True if the bar is at or past the force-exit time 15:15."""
-    ts = _to_naive(ts)
-    from datetime import time as dtime
-    return ts.time() >= dtime(*FORCE_EXIT_H)
+def is_force_exit(ts) -> bool:
+    return _to_naive(ts).time() >= FORCE_EXIT
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TRADE PLAN
-# ══════════════════════════════════════════════════════════════════════════════
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ATR5, ATR20 and session VWAP."""
+    df = df.copy()
+    df["atr5"]  = talib.ATR(df["high"], df["low"], df["close"], timeperiod=5)
+    df["atr20"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=20)
 
-def build_trade_plan(live_df: pd.DataFrame, signal: str):
-    """Return entry/sl/tp1/side dict or None if risk is zero."""
-    latest = live_df.iloc[-1]
-    buf    = 0.001  # 0.1% buffer on SL
+    # Session VWAP — resets each day
+    df["_date"] = pd.to_datetime(df.index).date
+    df["_tp"]   = (df["high"] + df["low"] + df["close"]) / 3
+    df["_tpv"]  = df["_tp"] * df["volume"]
+    df["_cum_tpv"] = df.groupby("_date")["_tpv"].cumsum()
+    df["_cum_vol"] = df.groupby("_date")["volume"].cumsum()
+    df["vwap"]  = df["_cum_tpv"] / df["_cum_vol"]
 
-    if signal == "LONG":
-        entry = float(latest["close"])
-        sl    = float(latest["low"]) * (1 - buf)
-        risk  = entry - sl
-        if risk <= 0:
-            return None
-        return {"side": "BUY",  "entry": entry, "sl": sl, "tp1": entry + TP1_RR * risk, "risk": risk}
-
-    elif signal == "SHORT":
-        entry = float(latest["close"])
-        sl    = float(latest["high"]) * (1 + buf)
-        risk  = sl - entry
-        if risk <= 0:
-            return None
-        return {"side": "SELL", "entry": entry, "sl": sl, "tp1": entry - TP1_RR * risk, "risk": risk}
-
-    return None
+    df.drop(columns=["_date", "_tp", "_tpv", "_cum_tpv", "_cum_vol"],
+            inplace=True, errors="ignore")
+    return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TRADE SIMULATION
-# ══════════════════════════════════════════════════════════════════════════════
+# ── trade simulation ──────────────────────────────────────────────────────────
 
-def simulate_trade(stock_df: pd.DataFrame, entry_idx: int, plan: dict):
+def simulate_trade(df: pd.DataFrame, entry_idx: int, entry_price: float,
+                   sl: float, tp1: float, side: str, trade_date) -> tuple:
     """
-    Simulate:
-      - Immediate SL hit → full loss
-      - TP1 hit first → book 50%, move SL to breakeven, trail rest with 3-bar low/high
-      - Force exit at 15:15 on same day
-
-    Returns (r_multiple, outcome_label)
+    Walk bars from entry_idx+1.
+    Returns (r_multiple, outcome_label).
+    Full exit at SL or TP1 — no partial.
     """
-    side   = plan["side"]
-    entry  = plan["entry"]
-    sl     = plan["sl"]
-    tp1    = plan["tp1"]
-    risk   = plan["risk"]
+    risk = abs(entry_price - sl)
+    if risk <= 0:
+        return 0.0, "NO_RISK"
 
-    future = stock_df.iloc[entry_idx + 1:].copy()
-    if future.empty:
-        return 0.0, "NO_DATA"
-
-    partial_done  = False
-    trail_sl      = sl
-    half = 0.5
-    rem  = 0.5
-
-    partial_pnl = 0.0
-    second_exit = None
-
-    # Determine same-day boundary
-    entry_date = _to_naive(stock_df.index[entry_idx]).date()
+    future = df.iloc[entry_idx + 1:]
 
     for j in range(len(future)):
-        bar      = future.iloc[j]
-        bar_time = future.index[j]
-        bar_ts   = _to_naive(bar_time)
+        bar    = future.iloc[j]
+        bar_ts = _to_naive(future.index[j])
 
         # Force exit at end of day
-        if bar_ts.date() != entry_date or is_force_exit_bar(bar_ts):
-            close = float(bar["close"])
-            if partial_done:
-                second_exit = close
-            else:
-                pnl_pts = (close - entry) if side == "BUY" else (entry - close)
-                return pnl_pts / risk, "FORCE_EXIT"
-            break
+        if bar_ts.date() != trade_date or is_force_exit(bar_ts):
+            close   = float(bar["close"])
+            pnl_pts = (close - entry_price) if side == "BUY" else (entry_price - close)
+            return round(pnl_pts / risk, 3), "FORCE_EXIT"
 
         hi = float(bar["high"])
         lo = float(bar["low"])
 
-        if not partial_done:
-            # SL check
-            if (side == "BUY"  and lo  <= sl) or \
-               (side == "SELL" and hi  >= sl):
-                return -1.0, "SL_HIT"
+        # SL check
+        if (side == "BUY"  and lo  <= sl) or \
+           (side == "SELL" and hi  >= sl):
+            return -1.0, "SL_HIT"
 
-            # TP1 check
-            if (side == "BUY"  and hi  >= tp1) or \
-               (side == "SELL" and lo  <= tp1):
-                partial_done = True
-                partial_pnl  = TP1_RR * half   # 50% at TP1 = 0.75R
-                trail_sl     = entry            # move SL to breakeven
+        # TP1 check
+        if (side == "BUY"  and hi  >= tp1) or \
+           (side == "SELL" and lo  <= tp1):
+            return round(TP1_RR, 3), "TP1_HIT"
 
-        else:
-            # Trail with last 3 bars
-            if j >= 2:
-                last3 = future.iloc[max(0, j - 2): j + 1]
-                if side == "BUY":
-                    new_trail = float(last3["low"].min())
-                    trail_sl  = max(trail_sl, new_trail)
-                    if lo <= trail_sl:
-                        second_exit = trail_sl
-                        break
-                else:
-                    new_trail = float(last3["high"].max())
-                    trail_sl  = min(trail_sl, new_trail)
-                    if hi >= trail_sl:
-                        second_exit = trail_sl
-                        break
-
-    # If partial and no trail exit yet, use last close
-    if partial_done and second_exit is None:
-        last = future.iloc[-1]
-        second_exit = float(last["close"])
-
-    if not partial_done:
-        # Timed out without TP1
-        last    = future.iloc[-1]
-        pnl_pts = (float(last["close"]) - entry) if side == "BUY" else (entry - float(last["close"]))
-        return pnl_pts / risk, "TIMEOUT"
-
-    second_r = ((second_exit - entry) / risk) if side == "BUY" else \
-               ((entry - second_exit) / risk)
-
-    total_r = partial_pnl + second_r * rem
-    return total_r, "TP1_TRAIL"
+    return 0.0, "END_OF_DATA"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PER-SYMBOL BACKTEST
-# ══════════════════════════════════════════════════════════════════════════════
+# ── per-symbol backtest ───────────────────────────────────────────────────────
 
-def backtest_symbol(symbol: str, stock_df, nifty_df) -> tuple[list, dict]:
+def backtest_symbol(symbol: str, stock_df: pd.DataFrame) -> list:
     """
-    Returns (trade_rows, metrics_dict).
-    trade_rows: list of dicts, one per trade
-    metrics_dict: summary stats for this symbol
+    Walk 5-min bars, apply 3-state machine, simulate trades.
+
+    Bar indexing at scan point i (treating bar i as last completed):
+      Box candles    : bars i-4 to i   (5 bars)
+      VWAP/direction : bar i close + VWAP
+      confirmed_ts   : bar i timestamp (time gap starts here)
+      Breakout bar   : bar i+1  (new candle after confirmation)
+      Pullback bar   : bar i+2
+      LIMIT fill bar : bar i+3  (fills if price hits box edge ± 0.5%)
+      Trade sim      : from bar i+4 onwards
     """
     try:
-        stock = standardize_df(stock_df).copy()
-        nifty = standardize_df(nifty_df).copy()
-
-        stock = add_full_indicators(stock).dropna().copy()
-        nifty = add_full_indicators(nifty).dropna().copy()
+        df = standardize_df(stock_df).copy()
+        df = add_indicators(df).dropna()
     except Exception as e:
-        return [], {"error": str(e)}
+        return []
 
-    if stock.empty or nifty.empty or len(stock) < 60:
-        return [], {"error": "insufficient data"}
+    N = len(df)
+    C = CONSOLIDATION_CANDLES  # 5
+    if N < C + 6:
+        return []
 
     trades = []
-    max_i  = min(len(stock), len(nifty)) - 5
+    i = C  # start with enough history
 
-    for i in range(50, max_i):
-        bar_ts = stock.index[i]
-        if not is_entry_bar(bar_ts):
+    while i < N - 5:
+        bar_ts = _to_naive(df.index[i])
+
+        if not in_entry_window(bar_ts):
+            i += 1
             continue
 
-        stock_slice = stock.iloc[:i + 1]
-        nifty_slice = nifty.iloc[:i + 1]
+        # ── STATE 1: Consolidation ──────────────────────────────
+        box = df.iloc[i - C + 1: i + 1]   # bars i-4 to i (inclusive) = 5 bars
+        box_high = float(box["high"].max())
+        box_low  = float(box["low"].min())
 
-        rank = rank_stock(stock_slice, nifty_slice)
-        if not rank or rank["decision"] == "SKIP":
+        if box_low <= 0:
+            i += 1
             continue
 
-        # Volume filter — using FULL historical 20-bar average (not session-only)
-        # This is more stable than session-only average (especially early morning)
-        if i >= 20:
-            current_vol = float(stock.iloc[i]["volume"])
-            hist_avg_vol = stock["volume"].iloc[i-20:i].mean()
-            rvol_full = current_vol / hist_avg_vol if hist_avg_vol > 0 else 0
-            vol_score_full = (10 if rvol_full > 2.5 else
-                              8  if rvol_full > 1.5 else
-                              6  if rvol_full > 1.2 else
-                              4  if rvol_full > 0.8 else 1)
+        range_pct = (box_high - box_low) / box_low
+        if range_pct > CONSOLIDATION_RANGE_PCT:
+            i += 1
+            continue
+
+        atr5  = float(df["atr5"].iloc[i])
+        atr20 = float(df["atr20"].iloc[i])
+        if pd.isna(atr5) or pd.isna(atr20) or atr20 == 0:
+            i += 1
+            continue
+        if atr5 >= ATR_SQUEEZE_RATIO * atr20:
+            i += 1
+            continue
+
+        close_i = float(df["close"].iloc[i])
+        vwap_i  = float(df["vwap"].iloc[i])
+
+        if close_i >= vwap_i:
+            diff = (close_i - vwap_i) / vwap_i
+            if not (0 <= diff <= VWAP_PROXIMITY_PCT):
+                i += 1
+                continue
+            direction = "LONG"
         else:
-            vol_score_full = rank.get("volume_score", 0)
+            diff = (vwap_i - close_i) / vwap_i
+            if not (0 <= diff <= VWAP_PROXIMITY_PCT):
+                i += 1
+                continue
+            direction = "SHORT"
 
-        if vol_score_full < 4:
+        # ── STATE 2: Breakout at bar i+1 (time gap enforced) ────
+        if i + 1 >= N:
+            i += 1
             continue
 
-        live_df = prepare_live_df(stock_slice)
-        if live_df is None or len(live_df) < 4:
+        bo_bar   = df.iloc[i + 1]
+        bo_ts    = _to_naive(df.index[i + 1])
+        bo_close = float(bo_bar["close"])
+
+        if bo_ts.date() != bar_ts.date() or not in_entry_window(bo_ts):
+            i += 1
             continue
 
-        decision = rank["decision"]
-        signal   = None
-
-        if decision == "LONG":
-            ok, _ = confirm_long_pullback(live_df)
-            if ok:
-                signal = "LONG"
-        elif decision == "SHORT":
-            ok, _ = confirm_short_pullback(live_df)
-            if ok:
-                signal = "SHORT"
-
-        if not signal:
+        if direction == "LONG"  and bo_close <= box_high:
+            i += 1
+            continue
+        if direction == "SHORT" and bo_close >= box_low:
+            i += 1
             continue
 
-        plan = build_trade_plan(live_df, signal)
-        if not plan:
+        # ── STATE 3: Pullback at bar i+2 ─────────────────────────
+        if i + 2 >= N:
+            i += 1
             continue
 
-        r_mult, outcome = simulate_trade(stock, i, plan)
+        pb_bar   = df.iloc[i + 2]
+        pb_ts    = _to_naive(df.index[i + 2])
+        pb_close = float(pb_bar["close"])
+        pb_vwap  = float(pb_bar["vwap"])
+
+        if pb_ts.date() != bar_ts.date() or not in_entry_window(pb_ts):
+            i += 1
+            continue
+
+        if direction == "LONG":
+            if pb_close <= box_high:
+                i += 1
+                continue  # back in box
+            pb_diff = (pb_close - pb_vwap) / pb_vwap if pb_vwap > 0 else 1.0
+            if not (0 <= pb_diff <= VWAP_PULLBACK_PCT):
+                i += 1
+                continue
+        else:
+            if pb_close >= box_low:
+                i += 1
+                continue  # back in box
+            pb_diff = (pb_vwap - pb_close) / pb_vwap if pb_vwap > 0 else 1.0
+            if not (0 <= pb_diff <= VWAP_PULLBACK_PCT):
+                i += 1
+                continue
+
+        # ── LIMIT fill at bar i+3 ─────────────────────────────────
+        if i + 3 >= N:
+            i += 1
+            continue
+
+        fill_bar = df.iloc[i + 3]
+        fill_ts  = _to_naive(df.index[i + 3])
+
+        if fill_ts.date() != bar_ts.date():
+            i += 1
+            continue
+
+        if direction == "LONG":
+            entry = box_high * (1 + ENTRY_LIMIT_PCT)
+            sl    = box_low  * (1 - 0.001)
+            side  = "BUY"
+            if float(fill_bar["low"]) > entry:
+                i += 1
+                continue  # LIMIT didn't fill
+        else:
+            entry = box_low  * (1 - ENTRY_LIMIT_PCT)
+            sl    = box_high * (1 + 0.001)
+            side  = "SELL"
+            if float(fill_bar["high"]) < entry:
+                i += 1
+                continue  # LIMIT didn't fill
+
+        risk = abs(entry - sl)
+        if risk <= 0:
+            i += 1
+            continue
+
+        tp1 = (entry + TP1_RR * risk) if direction == "LONG" else (entry - TP1_RR * risk)
+
+        r_mult, outcome = simulate_trade(df, i + 3, entry, sl, tp1, side, bar_ts.date())
 
         trades.append({
-            "symbol":  symbol,
-            "signal":  signal,
-            "entry":   round(plan["entry"], 2),
-            "sl":      round(plan["sl"], 2),
-            "tp1":     round(plan["tp1"], 2),
-            "r_mult":  round(r_mult, 3),
-            "outcome": outcome,
+            "symbol":    symbol,
+            "direction": direction,
+            "date":      str(bar_ts.date()),
+            "entry_ts":  str(df.index[i + 3]),
+            "entry":     round(entry, 2),
+            "sl":        round(sl, 2),
+            "tp1":       round(tp1, 2),
+            "box_high":  round(box_high, 2),
+            "box_low":   round(box_low, 2),
+            "range_pct": round(range_pct * 100, 2),
+            "atr_ratio": round(atr5 / atr20, 3),
+            "r_mult":    r_mult,
+            "outcome":   outcome,
         })
 
-    if not trades:
-        return [], {"trades": 0, "win_rate": 0, "avg_r": 0, "profit_factor": 0}
+        i += 5  # skip past fill bar to avoid overlapping setups
 
-    df   = pd.DataFrame(trades)
-    wins = df[df["r_mult"] > 0]
-    loss = df[df["r_mult"] <= 0]
-    gp   = wins["r_mult"].sum()
-    gl   = abs(loss["r_mult"].sum())
-    pf   = round(gp / gl, 2) if gl > 0 else float("inf")
-
-    metrics = {
-        "trades":        len(df),
-        "win_rate":      round(len(wins) / len(df) * 100, 1),
-        "avg_r":         round(df["r_mult"].mean(), 3),
-        "profit_factor": pf,
-        "long_trades":   int((df["signal"] == "LONG").sum()),
-        "short_trades":  int((df["signal"] == "SHORT").sum()),
-    }
-    return trades, metrics
+    return trades
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def run():
     start_wall = time.time()
-    logger.info("=" * 60)
-    logger.info(f"  WEEKLY BACKTEST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    logger.info(f"  Universe: {len(NIFTY_200)} stocks | Timeframe: 5-min (last 3 months)")
-    logger.info("=" * 60)
+    logger.info("=" * 62)
+    logger.info(f"  CONSOLIDATION BREAKOUT BACKTEST — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    logger.info(f"  Universe: {len(NIFTY_50)} stocks (NIFTY 50) | Timeframe: 5-min")
+    logger.info("=" * 62)
 
-    # ── connect ───────────────────────────────────────────────────────────────
     tsl = connect()
 
-    # ── fetch NIFTY ───────────────────────────────────────────────────────────
-    logger.info("Fetching NIFTY index data...")
-    nifty_df = tsl.get_historical_data(
-        tradingsymbol="NIFTY", exchange="INDEX", timeframe="5"
-    )
-    if nifty_df is None or nifty_df.empty:
-        logger.error("Could not fetch NIFTY data. Aborting.")
-        return
+    all_trades = []
+    sym_stats  = []
+    skipped    = []
 
-    logger.info(f"NIFTY: {len(nifty_df)} bars fetched.")
-
-    # ── backtest each symbol ──────────────────────────────────────────────────
-    all_trades   = []
-    symbol_stats = []
-    skipped      = []
-
-    total = len(NIFTY_200)
-    for idx, sym in enumerate(NIFTY_200, 1):
-        logger.info(f"[{idx:>3}/{total}] {sym:<20}", )
-
+    for idx, sym in enumerate(NIFTY_50, 1):
+        logger.info(f"[{idx:>2}/{len(NIFTY_50)}] {sym:<16}", )
         try:
             time.sleep(SLEEP_BETWEEN)
-            stock_df = tsl.get_historical_data(
-                tradingsymbol=sym, exchange="NSE", timeframe="5"
-            )
-
-            if stock_df is None or stock_df.empty or len(stock_df) < 100:
+            df = tsl.get_historical_data(tradingsymbol=sym, exchange="NSE", timeframe="5")
+            if df is None or df.empty or len(df) < 60:
                 logger.info(f"        → skipped (no data)")
                 skipped.append(sym)
                 continue
 
-            trades, metrics = backtest_symbol(sym, stock_df, nifty_df)
-
-            if "error" in metrics:
-                logger.info(f"        → skipped ({metrics['error']})")
-                skipped.append(sym)
+            trades = backtest_symbol(sym, df)
+            if not trades:
+                logger.info(f"        → 0 setups found")
+                sym_stats.append({"symbol": sym, "trades": 0, "win_rate": 0,
+                                   "avg_r": 0, "profit_factor": 0,
+                                   "long_trades": 0, "short_trades": 0})
                 continue
 
-            metrics["symbol"] = sym
-            symbol_stats.append(metrics)
             all_trades.extend(trades)
+            tdf  = pd.DataFrame(trades)
+            wins = tdf[tdf["r_mult"] > 0]
+            loss = tdf[tdf["r_mult"] <= 0]
+            gp   = wins["r_mult"].sum()
+            gl   = abs(loss["r_mult"].sum())
+            pf   = round(gp / gl, 2) if gl > 0 else float("inf")
+            wr   = round(len(wins) / len(tdf) * 100, 1)
+            ar   = round(tdf["r_mult"].mean(), 3)
+
+            sym_stats.append({
+                "symbol":       sym,
+                "trades":       len(tdf),
+                "win_rate":     wr,
+                "avg_r":        ar,
+                "profit_factor": pf,
+                "long_trades":  int((tdf["direction"] == "LONG").sum()),
+                "short_trades": int((tdf["direction"] == "SHORT").sum()),
+            })
 
             logger.info(
-                f"        → {metrics['trades']:>3} trades | "
-                f"WR {metrics['win_rate']:>5.1f}% | "
-                f"avg_R {metrics['avg_r']:>+.3f} | "
-                f"PF {metrics['profit_factor']:>4.2f}"
+                f"        → {len(tdf):>3} trades | "
+                f"WR {wr:>5.1f}% | avg_R {ar:>+.3f} | PF {pf:>4.2f}"
             )
 
         except Exception as e:
             logger.warning(f"        → error: {e}")
             skipped.append(sym)
 
-    # ── build report ──────────────────────────────────────────────────────────
-    if not symbol_stats:
-        logger.error("No symbols backtested successfully.")
+    # ── save full report ──────────────────────────────────────────────────────
+    if not all_trades:
+        logger.error("No trades found across all symbols.")
         return
 
-    stats_df = pd.DataFrame(symbol_stats).sort_values("avg_r", ascending=False)
-
-    # ── filter preferred ──────────────────────────────────────────────────────
-    preferred = stats_df[
-        (stats_df["trades"]        >= MIN_TRADES)       &
-        (stats_df["profit_factor"] >= MIN_PROFIT_FACTOR) &
-        (stats_df["avg_r"]         >= MIN_AVG_R)
-    ].head(MAX_STOCKS)
-
-    # ── save results ──────────────────────────────────────────────────────────
     report_path = RESULTS_DIR / f"report_{datetime.now().strftime('%Y%m%d')}.csv"
-    stats_df.to_csv(report_path, index=False)
-    logger.info(f"\nFull report saved → {report_path}")
+    pd.DataFrame(all_trades).to_csv(report_path, index=False)
+    logger.info(f"\nFull trade log saved → {report_path}")
 
-    if not preferred.empty:
-        preferred[["symbol"]].to_csv(WATCHLIST_OUT, index=False)
-        logger.info(f"Watchlist saved → {WATCHLIST_OUT}")
-    else:
-        logger.warning("No stocks passed the filter. Watchlist NOT updated.")
+    stats_df = pd.DataFrame(sym_stats).sort_values("avg_r", ascending=False)
 
     # ── print summary ─────────────────────────────────────────────────────────
     elapsed = (time.time() - start_wall) / 60
-    print("\n" + "=" * 60)
+    all_df  = pd.DataFrame(all_trades)
+    total_t = len(all_df)
+    wins_t  = len(all_df[all_df["r_mult"] > 0])
+    avg_r_t = round(all_df["r_mult"].mean(), 3)
+    gp_t    = all_df[all_df["r_mult"] > 0]["r_mult"].sum()
+    gl_t    = abs(all_df[all_df["r_mult"] <= 0]["r_mult"].sum())
+    pf_t    = round(gp_t / gl_t, 2) if gl_t > 0 else float("inf")
+
+    print("\n" + "=" * 62)
     print(f"  BACKTEST COMPLETE  ({elapsed:.1f} min)")
-    print("=" * 60)
-    print(f"  Universe   : {total} stocks")
-    print(f"  Backtested : {len(symbol_stats)}")
-    print(f"  Skipped    : {len(skipped)}")
-    print(f"  Qualified  : {len(preferred)}")
+    print("=" * 62)
+    print(f"  Universe    : {len(NIFTY_50)} stocks | Skipped: {len(skipped)}")
+    print(f"  Total trades: {total_t}")
+    print(f"  Win rate    : {wins_t/total_t*100:.1f}%")
+    print(f"  Avg R       : {avg_r_t:+.3f}")
+    print(f"  Profit factor: {pf_t:.2f}")
     print()
 
-    if not preferred.empty:
-        print(f"{'SYMBOL':<16} {'TRADES':>6} {'WIN%':>6} {'AVG_R':>7} {'PF':>6}")
-        print("-" * 46)
-        for _, row in preferred.iterrows():
-            print(
-                f"{row['symbol']:<16} "
-                f"{int(row['trades']):>6} "
-                f"{row['win_rate']:>5.1f}% "
-                f"{row['avg_r']:>+7.3f} "
-                f"{row['profit_factor']:>6.2f}"
-            )
-        print()
-        print("✅ Watchlist updated:")
-        print("  ", ", ".join(preferred["symbol"].tolist()))
-    else:
-        print("⚠️  No stocks passed the filter this week.")
-        print("   Tip: loosen MIN_TRADES / MIN_PROFIT_FACTOR / MIN_AVG_R thresholds.")
+    long_df  = all_df[all_df["direction"] == "LONG"]
+    short_df = all_df[all_df["direction"] == "SHORT"]
+    if not long_df.empty:
+        print(f"  LONG  trades: {len(long_df)} | WR:{len(long_df[long_df['r_mult']>0])/len(long_df)*100:.1f}% | avg_R:{long_df['r_mult'].mean():+.3f}")
+    if not short_df.empty:
+        print(f"  SHORT trades: {len(short_df)} | WR:{len(short_df[short_df['r_mult']>0])/len(short_df)*100:.1f}% | avg_R:{short_df['r_mult'].mean():+.3f}")
 
-    print("=" * 60)
+    print()
+    print(f"  Outcome breakdown:")
+    for outcome, cnt in all_df["outcome"].value_counts().items():
+        print(f"    {outcome:<15}: {cnt:>4} ({cnt/total_t*100:.1f}%)")
 
-    # ── signal breakdown ──────────────────────────────────────────────────────
-    long_r = short_r = 0.0
-    if all_trades:
-        all_df  = pd.DataFrame(all_trades)
-        long_r  = all_df[all_df["signal"] == "LONG"]["r_mult"].mean()
-        short_r = all_df[all_df["signal"] == "SHORT"]["r_mult"].mean()
-        print(f"\nSignal edge across all qualified stocks:")
-        print(f"  LONG  trades avg R = {long_r:+.3f}")
-        print(f"  SHORT trades avg R = {short_r:+.3f}")
-
-    # ── Telegram report ───────────────────────────────────────────────────────
-    from datetime import timedelta
-    next_sunday = (datetime.now() + timedelta(days=(6 - datetime.now().weekday()) % 7 + 1)).strftime("%d %b %Y")
-
-    if not preferred.empty:
-        lines = [
-            f"📊 WEEKLY WATCHLIST — {datetime.now().strftime('%d %b %Y')}",
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            f"Universe : {total} stocks tested",
-            f"Selected : {len(preferred)} stocks",
-            f"Duration : {elapsed:.0f} minutes",
-            f"",
-            f"{'#':<3} {'Stock':<12} {'WR%':>5} {'AvgR':>6} {'PF':>5}",
-            f"{'─'*35}",
-        ]
-        for i, (_, row) in enumerate(preferred.iterrows(), 1):
-            lines.append(
-                f"{i:<3} {row['symbol']:<12} {row['win_rate']:>4.1f}% {row['avg_r']:>+6.3f} {row['profit_factor']:>5.2f}"
-            )
-        lines += [
-            f"",
-            f"Signal edge (qualified stocks):",
-            f"  LONG  avg R = {long_r:+.3f}",
-            f"  SHORT avg R = {short_r:+.3f}",
-            f"",
-            f"⏰ Next backtest: {next_sunday}",
-        ]
-        send_telegram("\n".join(lines))
-        logger.info("Telegram watchlist report sent.")
-    else:
-        send_telegram(
-            f"⚠️ WEEKLY BACKTEST — {datetime.now().strftime('%d %b %Y')}\n"
-            f"No stocks passed the filter this week.\n"
-            f"Watchlist NOT updated. Check thresholds."
+    print()
+    print(f"{'#':<3} {'SYMBOL':<14} {'TRADES':>6} {'WR%':>6} {'AVG_R':>7} {'PF':>6}")
+    print("-" * 44)
+    for rank, (_, row) in enumerate(stats_df[stats_df["trades"] > 0].head(20).iterrows(), 1):
+        print(
+            f"{rank:<3} {row['symbol']:<14} "
+            f"{int(row['trades']):>6} "
+            f"{row['win_rate']:>5.1f}% "
+            f"{row['avg_r']:>+7.3f} "
+            f"{row['profit_factor']:>6.2f}"
         )
+    print("=" * 62)
 
 
 if __name__ == "__main__":
