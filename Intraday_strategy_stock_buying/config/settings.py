@@ -39,7 +39,7 @@ POLL_INTERVAL_SECONDS = 60       # Slow loop (scans for new entries)
 FAST_POLL_INTERVAL_SECONDS = 5   # Fast loop (manages active trades)
 
 ENTRY_START = time(9, 30)
-ENTRY_END   = time(14, 30)   # consolidation breakout entry cutoff
+ENTRY_END   = time(15, 10)   # consolidation breakout entry cutoff
 FORCE_EXIT  = time(15, 15)
 
 # =========================================================
