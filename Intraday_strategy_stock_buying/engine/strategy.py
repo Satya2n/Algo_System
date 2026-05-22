@@ -674,7 +674,8 @@ def is_consolidating(
         df["atr5"]  = talib.ATR(df["high"], df["low"], df["close"], timeperiod=5)
         df["atr20"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=20)
 
-        recent   = df.tail(candles)
+        # Exclude the current forming candle — use only completed bars
+        recent   = df.iloc[-(candles + 1):-1]
         box_high = float(recent["high"].max())
         box_low  = float(recent["low"].min())
 
@@ -725,9 +726,10 @@ def is_breakout(
     try:
         df = standardize_df(stock_full)
         today = get_today_session(df)
-        if today.empty:
+        if today.empty or len(today) < 2:
             return False, 0.0
-        close = float(today["close"].iloc[-1])
+        # Use last COMPLETED candle close — iloc[-2] skips the forming candle
+        close = float(today["close"].iloc[-2])
         if direction == "LONG"  and close > box_high:
             return True, close
         if direction == "SHORT" and close < box_low:
